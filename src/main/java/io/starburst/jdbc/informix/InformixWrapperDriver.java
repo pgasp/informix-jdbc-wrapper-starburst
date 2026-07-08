@@ -24,19 +24,23 @@ public class InformixWrapperDriver implements Driver {
     private static final String WRAPPER_PREFIX = "jdbc:informix:";
     private static final String IBM_PREFIX = "jdbc:informix-sqli:";
 
+    private static final Driver IBM_DRIVER;
+
     static {
         try {
-            Class.forName("com.informix.jdbc.IfxDriver");
+            IBM_DRIVER = (Driver) Class.forName("com.informix.jdbc.IfxDriver")
+                    .getDeclaredConstructor()
+                    .newInstance();
             DriverManager.registerDriver(new InformixWrapperDriver());
         } catch (ClassNotFoundException e) {
             throw new ExceptionInInitializerError(
                     "IBM Informix JDBC driver (ifxjdbc.jar) not found in classpath: " + e.getMessage());
-        } catch (SQLException e) {
+        } catch (Exception e) {
             throw new ExceptionInInitializerError(e);
         }
     }
 
-    private static String rewrite(String url) {
+    static String rewrite(String url) {
         if (url != null && url.startsWith(WRAPPER_PREFIX)) {
             return IBM_PREFIX + url.substring(WRAPPER_PREFIX.length());
         }
@@ -48,7 +52,7 @@ public class InformixWrapperDriver implements Driver {
         if (!acceptsURL(url)) {
             return null;
         }
-        return DriverManager.getConnection(rewrite(url), info);
+        return IBM_DRIVER.connect(rewrite(url), info);
     }
 
     @Override
@@ -58,8 +62,7 @@ public class InformixWrapperDriver implements Driver {
 
     @Override
     public DriverPropertyInfo[] getPropertyInfo(String url, Properties info) throws SQLException {
-        Driver ibmDriver = DriverManager.getDriver(rewrite(url));
-        return ibmDriver.getPropertyInfo(rewrite(url), info);
+        return IBM_DRIVER.getPropertyInfo(rewrite(url), info);
     }
 
     @Override
