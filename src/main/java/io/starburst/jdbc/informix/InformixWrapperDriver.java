@@ -1,6 +1,11 @@
 package io.starburst.jdbc.informix;
 
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.sql.Connection;
+import java.sql.DatabaseMetaData;
 import java.sql.Driver;
 import java.sql.DriverManager;
 import java.sql.DriverPropertyInfo;
@@ -13,6 +18,9 @@ import java.util.logging.Logger;
  * Accepts jdbc:informix: URLs and rewrites them to jdbc:informix-sqli: before
  * delegating to the IBM IfxDriver. This bypasses Starburst Enterprise's
  * BaseJdbcConfig URL validation which rejects hyphens in the JDBC sub-protocol.
+ *
+ * Also wraps Connection.getMetaData() to fix IfxDatabaseMetaData.getSchemas(String, String)
+ * which throws "Method not supported" in the IBM driver — falling back to the no-arg getSchemas().
  *
  * SEP catalog-values.yaml example:
  *   connector.name=generic-jdbc
@@ -52,7 +60,8 @@ public class InformixWrapperDriver implements Driver {
         if (!acceptsURL(url)) {
             return null;
         }
-        return IBM_DRIVER.connect(rewrite(url), info);
+        Connection conn = IBM_DRIVER.connect(rewrite(url), info);
+        return conn == null ? null : wrapConnection(conn);
     }
 
     @Override
@@ -72,7 +81,7 @@ public class InformixWrapperDriver implements Driver {
 
     @Override
     public int getMinorVersion() {
-        return 0;
+        return 1;
     }
 
     @Override
@@ -83,5 +92,60 @@ public class InformixWrapperDriver implements Driver {
     @Override
     public Logger getParentLogger() throws SQLFeatureNotSupportedException {
         throw new SQLFeatureNotSupportedException("java.util.logging not used");
+    }
+
+    static Connection wrapConnection(Connection conn) {
+        return (Connection) Proxy.newProxyInstance(
+                InformixWrapperDriver.class.getClassLoader(),
+                new Class<?>[] {Connection.class},
+                new ConnectionHandler(conn));
+    }
+
+    static DatabaseMetaData wrapDatabaseMetaData(DatabaseMetaData meta) {
+        return (DatabaseMetaData) Proxy.newProxyInstance(
+                InformixWrapperDriver.class.getClassLoader(),
+                new Class<?>[] {DatabaseMetaData.class},
+                new DatabaseMetaDataHandler(meta));
+    }
+
+    static final class ConnectionHandler implements InvocationHandler {
+        private final Connection delegate;
+
+        ConnectionHandler(Connection delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+            if ("getMetaData".equals(method.getName()) && (args == null || args.length == 0)) {
+                return wrapDatabaseMetaData(delegate.getMetaData());
+            }
+            try {
+                return method.invoke(delegate, args);
+            } catch (InvocationTargetException e) {
+                throw e.getCause();
+            }
+        }
+    }
+
+    static final class DatabaseMetaDataHandler implements InvocationHandler {
+        private final DatabaseMetaData delegate;
+
+        DatabaseMetaDataHandler(DatabaseMetaData delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+            // IfxDatabaseMetaData does not implement getSchemas(String, String) — fall back to no-arg
+            if ("getSchemas".equals(method.getName()) && args != null && args.length == 2) {
+                return delegate.getSchemas();
+            }
+            try {
+                return method.invoke(delegate, args);
+            } catch (InvocationTargetException e) {
+                throw e.getCause();
+            }
+        }
     }
 }

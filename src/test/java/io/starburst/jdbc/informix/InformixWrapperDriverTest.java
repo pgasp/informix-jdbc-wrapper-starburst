@@ -5,7 +5,11 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.lang.reflect.Proxy;
+import java.sql.Connection;
+import java.sql.DatabaseMetaData;
 import java.sql.DriverPropertyInfo;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
 import java.util.Properties;
@@ -98,6 +102,97 @@ class InformixWrapperDriverTest {
         assertNull(com.informix.jdbc.IfxDriver.lastConnectedUrl);
     }
 
+    // --- DatabaseMetaData wrapping ---
+
+    private static ResultSet emptyResultSet() {
+        return (ResultSet) Proxy.newProxyInstance(
+                InformixWrapperDriverTest.class.getClassLoader(),
+                new Class<?>[] {ResultSet.class},
+                (proxy, method, args) -> {
+                    if ("next".equals(method.getName())) return false;
+                    if ("close".equals(method.getName())) return null;
+                    throw new UnsupportedOperationException(method.getName());
+                });
+    }
+
+    private static DatabaseMetaData stubMeta(ResultSet noArgResult, boolean[] noArgCalled, boolean[] twoArgCalled) {
+        return (DatabaseMetaData) Proxy.newProxyInstance(
+                InformixWrapperDriverTest.class.getClassLoader(),
+                new Class<?>[] {DatabaseMetaData.class},
+                (proxy, method, args) -> {
+                    if ("getSchemas".equals(method.getName())) {
+                        if (args == null || args.length == 0) {
+                            if (noArgCalled != null) noArgCalled[0] = true;
+                            return noArgResult;
+                        }
+                        if (args.length == 2) {
+                            if (twoArgCalled != null) twoArgCalled[0] = true;
+                            throw new SQLException("Method not supported : IfxDatabaseMetaData.getSchemas(String, String)");
+                        }
+                    }
+                    throw new UnsupportedOperationException(method.getName());
+                });
+    }
+
+    @Test
+    void wrapDatabaseMetaData_getSchemas2Args_delegatesToNoArg() throws SQLException {
+        ResultSet rs = emptyResultSet();
+        boolean[] noArgCalled = {false};
+        boolean[] twoArgCalled = {false};
+
+        DatabaseMetaData wrapped = InformixWrapperDriver.wrapDatabaseMetaData(stubMeta(rs, noArgCalled, twoArgCalled));
+        ResultSet result = wrapped.getSchemas(null, null);
+
+        assertSame(rs, result);
+        assertTrue(noArgCalled[0], "no-arg getSchemas() should have been called");
+        assertFalse(twoArgCalled[0], "2-arg getSchemas() should NOT have been called");
+    }
+
+    @Test
+    void wrapDatabaseMetaData_getSchemas2Args_withSchemaPattern() throws SQLException {
+        ResultSet rs = emptyResultSet();
+        boolean[] noArgCalled = {false};
+        boolean[] twoArgCalled = {false};
+
+        DatabaseMetaData wrapped = InformixWrapperDriver.wrapDatabaseMetaData(stubMeta(rs, noArgCalled, twoArgCalled));
+        ResultSet result = wrapped.getSchemas("informix", "sysmaster%");
+
+        assertSame(rs, result);
+        assertTrue(noArgCalled[0]);
+        assertFalse(twoArgCalled[0]);
+    }
+
+    @Test
+    void wrapDatabaseMetaData_getSchemas0Args_passesThrough() throws SQLException {
+        ResultSet rs = emptyResultSet();
+        boolean[] noArgCalled = {false};
+
+        DatabaseMetaData wrapped = InformixWrapperDriver.wrapDatabaseMetaData(stubMeta(rs, noArgCalled, null));
+        ResultSet result = wrapped.getSchemas();
+
+        assertSame(rs, result);
+        assertTrue(noArgCalled[0]);
+    }
+
+    @Test
+    void wrapConnection_getMetaData_returnsWrappedProxy() throws SQLException {
+        ResultSet rs = emptyResultSet();
+        DatabaseMetaData innerMeta = stubMeta(rs, null, null);
+        Connection mockConn = (Connection) Proxy.newProxyInstance(
+                InformixWrapperDriverTest.class.getClassLoader(),
+                new Class<?>[] {Connection.class},
+                (proxy, method, args) -> {
+                    if ("getMetaData".equals(method.getName())) return innerMeta;
+                    throw new UnsupportedOperationException(method.getName());
+                });
+
+        Connection wrapped = InformixWrapperDriver.wrapConnection(mockConn);
+        DatabaseMetaData meta = wrapped.getMetaData();
+
+        assertNotSame(innerMeta, meta);
+        assertInstanceOf(DatabaseMetaData.class, meta);
+    }
+
     // --- getPropertyInfo ---
 
     @Test
@@ -115,8 +210,8 @@ class InformixWrapperDriverTest {
     }
 
     @Test
-    void getMinorVersion_returns0() {
-        assertEquals(0, driver.getMinorVersion());
+    void getMinorVersion_returns1() {
+        assertEquals(1, driver.getMinorVersion());
     }
 
     @Test
