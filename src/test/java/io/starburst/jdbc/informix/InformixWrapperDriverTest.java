@@ -155,8 +155,8 @@ class InformixWrapperDriverTest {
     }
 
     @Test
-    void getMinorVersion_returns1() {
-        assertEquals(1, driver.getMinorVersion());
+    void getMinorVersion_returns2() {
+        assertEquals(2, driver.getMinorVersion());
     }
 
     @Test
