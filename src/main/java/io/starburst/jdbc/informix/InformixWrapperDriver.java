@@ -19,8 +19,9 @@ import java.util.logging.Logger;
  * delegating to the IBM IfxDriver. This bypasses Starburst Enterprise's
  * BaseJdbcConfig URL validation which rejects hyphens in the JDBC sub-protocol.
  *
- * Also wraps Connection.getMetaData() to fix IfxDatabaseMetaData.getSchemas(String, String)
- * which throws "Method not supported" in the IBM driver — falling back to the no-arg getSchemas().
+ * Also wraps Connection.getMetaData() to override getIdentifierQuoteString() — returning
+ * a space character (the JDBC convention for "no quoting supported") so that Trino's
+ * generic-jdbc generates unquoted SQL identifiers, which Informix accepts natively.
  *
  * SEP catalog-values.yaml example:
  *   connector.name=generic-jdbc
@@ -137,9 +138,10 @@ public class InformixWrapperDriver implements Driver {
 
         @Override
         public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
-            // IfxDatabaseMetaData does not implement getSchemas(String, String) — fall back to no-arg
-            if ("getSchemas".equals(method.getName()) && args != null && args.length == 2) {
-                return delegate.getSchemas();
+            // Return a space (JDBC convention: "no quoting") so Trino generates unquoted SQL
+            // identifiers that Informix accepts natively, instead of double-quoted ones.
+            if ("getIdentifierQuoteString".equals(method.getName()) && (args == null || args.length == 0)) {
+                return " ";
             }
             try {
                 return method.invoke(delegate, args);
