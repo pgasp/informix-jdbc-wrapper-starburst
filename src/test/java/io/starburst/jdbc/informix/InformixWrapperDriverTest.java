@@ -11,6 +11,7 @@ import java.sql.DatabaseMetaData;
 import java.sql.DriverPropertyInfo;
 import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
+import java.sql.Statement;
 import java.util.Properties;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -155,8 +156,8 @@ class InformixWrapperDriverTest {
     }
 
     @Test
-    void getMinorVersion_returns2() {
-        assertEquals(2, driver.getMinorVersion());
+    void getMinorVersion_returns4() {
+        assertEquals(4, driver.getMinorVersion());
     }
 
     @Test
@@ -167,5 +168,75 @@ class InformixWrapperDriverTest {
     @Test
     void getParentLogger_throwsSQLFeatureNotSupportedException() {
         assertThrows(SQLFeatureNotSupportedException.class, () -> driver.getParentLogger());
+    }
+
+    // --- StatementHandler (DBeaver path) ---
+
+    /** Builds a mock Statement that captures the last SQL passed to execute(). */
+    private static class CapturingStatement {
+        String lastSql;
+
+        Statement proxy() {
+            return (Statement) Proxy.newProxyInstance(
+                    InformixWrapperDriverTest.class.getClassLoader(),
+                    new Class<?>[] {Statement.class},
+                    (p, method, args) -> {
+                        if (args != null && args.length > 0 && args[0] instanceof String)
+                            lastSql = (String) args[0];
+                        if (method.getName().equals("execute")) return Boolean.TRUE;
+                        if (method.getName().equals("executeQuery")) return null;
+                        if (method.getName().equals("executeUpdate")) return 0;
+                        if (method.getName().equals("addBatch")) return null;
+                        throw new UnsupportedOperationException(method.getName());
+                    });
+        }
+    }
+
+    @Test
+    void wrapStatement_execute_stripsCatalogPrefix() throws Exception {
+        CapturingStatement cap = new CapturingStatement();
+        Statement wrapped = InformixWrapperDriver.wrapStatement(cap.proxy(), "syn11.");
+
+        wrapped.execute("SELECT * FROM syn11.inf11adm.acc_hva LIMIT 1");
+
+        assertEquals("SELECT * FROM inf11adm.acc_hva LIMIT 1", cap.lastSql);
+    }
+
+    @Test
+    void wrapStatement_execute_noPrefix_unchanged() throws Exception {
+        CapturingStatement cap = new CapturingStatement();
+        Statement wrapped = InformixWrapperDriver.wrapStatement(cap.proxy(), "syn11.");
+
+        wrapped.execute("SELECT 1 FROM sysmaster:informix.systables");
+
+        assertEquals("SELECT 1 FROM sysmaster:informix.systables", cap.lastSql);
+    }
+
+    @Test
+    void wrapStatement_nullCatalogPrefix_sqlPassedThrough() throws Exception {
+        CapturingStatement cap = new CapturingStatement();
+        Statement wrapped = InformixWrapperDriver.wrapStatement(cap.proxy(), null);
+
+        wrapped.execute("SELECT * FROM syn11.inf11adm.acc_hva");
+
+        assertEquals("SELECT * FROM syn11.inf11adm.acc_hva", cap.lastSql);
+    }
+
+    @Test
+    void wrapConnection_createStatement_returnsWrappedStatement() throws Exception {
+        CapturingStatement cap = new CapturingStatement();
+        Connection mockConn = (Connection) Proxy.newProxyInstance(
+                InformixWrapperDriverTest.class.getClassLoader(),
+                new Class<?>[] {Connection.class},
+                (p, method, args) -> {
+                    if (method.getName().equals("createStatement")) return cap.proxy();
+                    throw new UnsupportedOperationException(method.getName());
+                });
+
+        Connection wrapped = InformixWrapperDriver.wrapConnection(mockConn, "syn11");
+        Statement stmt = wrapped.createStatement();
+        stmt.execute("SELECT * FROM syn11.inf11adm.acc_hva");
+
+        assertEquals("SELECT * FROM inf11adm.acc_hva", cap.lastSql);
     }
 }
