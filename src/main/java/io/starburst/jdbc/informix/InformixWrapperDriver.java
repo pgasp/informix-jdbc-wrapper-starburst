@@ -77,7 +77,8 @@ public class InformixWrapperDriver implements Driver {
         String rest = url.substring(WRAPPER_PREFIX.length());
 
         if (rest.startsWith("//")) {
-            // URL format: //host:port/database:...
+            // URL format: //host:port/database:INFORMIXSERVER=...
+            // colonIdx > 0 guards against empty database segment (e.g. //:INFORMIXSERVER=...)
             int slashIdx = rest.indexOf('/', 2);
             if (slashIdx >= 0) {
                 String dbPart = rest.substring(slashIdx + 1);
@@ -86,12 +87,15 @@ public class InformixWrapperDriver implements Driver {
                     return dbPart.substring(0, colonIdx);
                 }
             }
-        } else {
-            // Property format: Server=...;Database=value;...
-            for (String part : rest.split(";")) {
-                if (part.toLowerCase().startsWith("database=")) {
-                    return part.substring("database=".length());
-                }
+            // Fall through: database may be in a Database= property appended after INFORMIXSERVER=
+        }
+
+        // Property fallback — works for both pure property-format URLs and path-format URLs
+        // where Database= is specified as a semicolon-separated parameter
+        // (e.g. jdbc:informix://host:port/:INFORMIXSERVER=srv;Database=syn11)
+        for (String part : rest.split(";")) {
+            if (part.toLowerCase().startsWith("database=")) {
+                return part.substring("database=".length());
             }
         }
         return null;

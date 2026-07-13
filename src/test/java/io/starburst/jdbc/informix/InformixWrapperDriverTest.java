@@ -54,6 +54,37 @@ class InformixWrapperDriverTest {
         assertFalse(driver.acceptsURL(null));
     }
 
+    // --- extractDatabase ---
+
+    @Test
+    void extractDatabase_urlFormat_returnsDatabase() {
+        assertEquals("syn11",
+                InformixWrapperDriver.extractDatabase("jdbc:informix://host:9088/syn11:INFORMIXSERVER=srv"));
+    }
+
+    @Test
+    void extractDatabase_propertyFormat_returnsDatabase() {
+        assertEquals("syn11",
+                InformixWrapperDriver.extractDatabase("jdbc:informix:Server=host;Port=9088;Database=syn11;INFORMIXSERVER=srv"));
+    }
+
+    @Test
+    void extractDatabase_urlFormatEmptyPathDatabaseInProperty_returnsDatabase() {
+        // DBeaver-style URL: no database in path, Database= appended as property
+        assertEquals("syn11",
+                InformixWrapperDriver.extractDatabase("jdbc:informix://host:9088/:INFORMIXSERVER=srv;Database=syn11"));
+    }
+
+    @Test
+    void extractDatabase_noDatabase_returnsNull() {
+        assertNull(InformixWrapperDriver.extractDatabase("jdbc:informix://host:9088/:INFORMIXSERVER=srv"));
+    }
+
+    @Test
+    void extractDatabase_nonMatchingUrl_returnsNull() {
+        assertNull(InformixWrapperDriver.extractDatabase("jdbc:informix-sqli://host:9088/db:INFORMIXSERVER=srv"));
+    }
+
     // --- rewrite (URL transformation) ---
 
     @Test
