@@ -131,7 +131,7 @@ class InformixWrapperDriverTest {
                     throw new UnsupportedOperationException(method.getName());
                 });
 
-        Connection wrapped = InformixWrapperDriver.wrapConnection(mockConn);
+        Connection wrapped = InformixWrapperDriver.wrapConnection(mockConn, null);
         DatabaseMetaData meta = wrapped.getMetaData();
 
         assertNotSame(innerMeta, meta);
