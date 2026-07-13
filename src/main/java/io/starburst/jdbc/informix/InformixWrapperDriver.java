@@ -82,7 +82,7 @@ public class InformixWrapperDriver implements Driver {
 
     @Override
     public int getMinorVersion() {
-        return 2;
+        return 3;
     }
 
     @Override
@@ -121,9 +121,17 @@ public class InformixWrapperDriver implements Driver {
             if ("getMetaData".equals(method.getName()) && (args == null || args.length == 0)) {
                 return wrapDatabaseMetaData(delegate.getMetaData());
             }
+            if ("prepareStatement".equals(method.getName()) && args != null && args.length > 0) {
+                System.err.println("[InformixWrapper] prepareStatement SQL: " + args[0]);
+            }
             try {
                 return method.invoke(delegate, args);
             } catch (InvocationTargetException e) {
+                if ("prepareStatement".equals(method.getName()) && args != null && args.length > 0) {
+                    throw new SQLException(
+                        "[InformixWrapper] SQL rejected by Informix: [" + args[0] + "] — " + e.getCause().getMessage(),
+                        e.getCause());
+                }
                 throw e.getCause();
             }
         }
