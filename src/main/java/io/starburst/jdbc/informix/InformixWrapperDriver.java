@@ -44,14 +44,18 @@ public class InformixWrapperDriver implements Driver {
 
     static {
         try {
+            System.err.println("[InformixWrapper] v1.5.1 loading IBM IfxDriver...");
             IBM_DRIVER = (Driver) Class.forName("com.informix.jdbc.IfxDriver")
                     .getDeclaredConstructor()
                     .newInstance();
             DriverManager.registerDriver(new InformixWrapperDriver());
+            System.err.println("[InformixWrapper] v1.5.1 IBM IfxDriver loaded OK");
         } catch (ClassNotFoundException e) {
+            System.err.println("[InformixWrapper] FATAL: IBM IfxDriver not found in classpath: " + e.getMessage());
             throw new ExceptionInInitializerError(
                     "IBM Informix JDBC driver (ifxjdbc.jar) not found in classpath: " + e.getMessage());
         } catch (Exception e) {
+            System.err.println("[InformixWrapper] FATAL: init failed: " + e);
             throw new ExceptionInInitializerError(e);
         }
     }
@@ -107,8 +111,19 @@ public class InformixWrapperDriver implements Driver {
             return null;
         }
         String database = extractDatabase(url);
+        System.err.println("[InformixWrapper] connect() database=" + database + " url=" + maskUrl(url));
         Connection conn = IBM_DRIVER.connect(rewrite(url), info);
-        return conn == null ? null : wrapConnection(conn, database);
+        if (conn == null) {
+            System.err.println("[InformixWrapper] connect() → null (IBM driver rejected URL)");
+            return null;
+        }
+        System.err.println("[InformixWrapper] connect() → OK");
+        return wrapConnection(conn, database);
+    }
+
+    private static String maskUrl(String url) {
+        if (url == null) return null;
+        return url.replaceAll("(?i)(password=)[^;:&]+", "$1***");
     }
 
     @Override
@@ -193,6 +208,7 @@ public class InformixWrapperDriver implements Driver {
             try {
                 return method.invoke(delegate, args);
             } catch (InvocationTargetException e) {
+                System.err.println("[InformixWrapper] Connection." + method.getName() + " FAILED: " + e.getCause());
                 throw e.getCause();
             }
         }
@@ -232,6 +248,7 @@ public class InformixWrapperDriver implements Driver {
             try {
                 return method.invoke(delegate, args);
             } catch (InvocationTargetException e) {
+                System.err.println("[InformixWrapper] Statement." + name + " FAILED: " + e.getCause());
                 throw e.getCause();
             }
         }
@@ -246,16 +263,32 @@ public class InformixWrapperDriver implements Driver {
 
         @Override
         public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+            String name = method.getName();
             // Return a space (JDBC convention: "no quoting") so Trino generates unquoted SQL
             // identifiers that Informix accepts natively, instead of double-quoted ones.
-            if ("getIdentifierQuoteString".equals(method.getName()) && (args == null || args.length == 0)) {
+            if ("getIdentifierQuoteString".equals(name) && (args == null || args.length == 0)) {
+                System.err.println("[InformixWrapper] meta.getIdentifierQuoteString() → \" \" (override)");
                 return " ";
             }
+            System.err.println("[InformixWrapper] meta." + name + "(" + argsStr(args) + ")");
             try {
-                return method.invoke(delegate, args);
+                Object result = method.invoke(delegate, args);
+                System.err.println("[InformixWrapper] meta." + name + " → OK");
+                return result;
             } catch (InvocationTargetException e) {
+                System.err.println("[InformixWrapper] meta." + name + " FAILED: " + e.getCause());
                 throw e.getCause();
             }
+        }
+
+        private static String argsStr(Object[] args) {
+            if (args == null || args.length == 0) return "";
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < args.length; i++) {
+                if (i > 0) sb.append(", ");
+                sb.append(args[i]);
+            }
+            return sb.toString();
         }
     }
 }
