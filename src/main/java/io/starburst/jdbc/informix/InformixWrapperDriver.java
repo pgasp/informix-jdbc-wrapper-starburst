@@ -222,9 +222,14 @@ public class InformixWrapperDriver implements Driver {
     }
 
     // Rewrites args[0] (SQL string) by stripping the catalog prefix.
+    // Handles both unquoted (syn11.) and double-quoted ("syn11".) forms — Starburst
+    // generates double-quoted identifiers regardless of getIdentifierQuoteString().
     private static Object[] rewriteSqlArg(Object[] args, String catalogPrefix, String methodName) {
         String sql = (String) args[0];
-        String rewritten = sql.replace(catalogPrefix, "");
+        // catalogPrefix = "syn11." — strip quoted form first, then unquoted fallback
+        String dbName = catalogPrefix.endsWith(".") ? catalogPrefix.substring(0, catalogPrefix.length() - 1) : catalogPrefix;
+        String quotedPrefix = "\"" + dbName + "\".";
+        String rewritten = sql.replace(quotedPrefix, "").replace(catalogPrefix, "");
         if (!rewritten.equals(sql)) {
             System.err.println("[InformixWrapper] " + methodName + " stripped catalog prefix '" + catalogPrefix + "': " + rewritten);
             args = args.clone();
