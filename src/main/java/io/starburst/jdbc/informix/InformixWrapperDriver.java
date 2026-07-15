@@ -30,6 +30,9 @@ import java.util.logging.Logger;
  * (catalog:schema.table). Since the catalog is already set as the default database in
  * the connection URL, stripping the prefix is safe and produces valid Informix SQL.
  *
+ * Starburst generates double-quoted identifiers regardless of getIdentifierQuoteString(),
+ * so both unquoted (syn11.) and double-quoted ("syn11".) catalog prefixes are stripped.
+ *
  * SEP catalog-values.yaml example:
  *   connector.name=generic-jdbc
  *   generic-jdbc.driver-class=io.starburst.jdbc.informix.InformixWrapperDriver
@@ -44,12 +47,11 @@ public class InformixWrapperDriver implements Driver {
 
     static {
         try {
-            System.err.println("[InformixWrapper] v1.5.1 loading IBM IfxDriver...");
             IBM_DRIVER = (Driver) Class.forName("com.informix.jdbc.IfxDriver")
                     .getDeclaredConstructor()
                     .newInstance();
             DriverManager.registerDriver(new InformixWrapperDriver());
-            System.err.println("[InformixWrapper] v1.5.1 IBM IfxDriver loaded OK");
+            System.err.println("[InformixWrapper] v1.6.0 IBM IfxDriver loaded OK");
         } catch (ClassNotFoundException e) {
             System.err.println("[InformixWrapper] FATAL: IBM IfxDriver not found in classpath: " + e.getMessage());
             throw new ExceptionInInitializerError(
@@ -117,7 +119,6 @@ public class InformixWrapperDriver implements Driver {
             System.err.println("[InformixWrapper] connect() → null (IBM driver rejected URL)");
             return null;
         }
-        System.err.println("[InformixWrapper] connect() → OK");
         return wrapConnection(conn, database);
     }
 
@@ -143,7 +144,7 @@ public class InformixWrapperDriver implements Driver {
 
     @Override
     public int getMinorVersion() {
-        return 4;
+        return 6;
     }
 
     @Override
@@ -189,11 +190,8 @@ public class InformixWrapperDriver implements Driver {
         @Override
         public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
             String name = method.getName();
-            System.err.println("[InformixWrapper] Connection." + name + "(" + argsStr(args) + ")");
             if ("getMetaData".equals(name) && (args == null || args.length == 0)) {
-                DatabaseMetaData meta = wrapDatabaseMetaData(delegate.getMetaData());
-                System.err.println("[InformixWrapper] Connection.getMetaData → wrapped");
-                return meta;
+                return wrapDatabaseMetaData(delegate.getMetaData());
             }
             // Strip catalog prefix from SQL: Trino generates "syn11.schema.table" based on
             // TABLE_CAT returned by IBM metadata, but Informix only accepts "schema.table"
@@ -207,13 +205,10 @@ public class InformixWrapperDriver implements Driver {
             // the same catalog prefix rewrite to all SQL execution methods.
             if (name.startsWith("createStatement") && catalogPrefix != null) {
                 Statement stmt = (Statement) method.invoke(delegate, args);
-                System.err.println("[InformixWrapper] Connection.createStatement → wrapped");
                 return stmt == null ? null : wrapStatement(stmt, catalogPrefix);
             }
             try {
-                Object result = method.invoke(delegate, args);
-                System.err.println("[InformixWrapper] Connection." + name + " → OK");
-                return result;
+                return method.invoke(delegate, args);
             } catch (InvocationTargetException e) {
                 System.err.println("[InformixWrapper] Connection." + name + " FAILED: " + e.getCause());
                 throw e.getCause();
@@ -238,16 +233,6 @@ public class InformixWrapperDriver implements Driver {
         return args;
     }
 
-    static String argsStr(Object[] args) {
-        if (args == null || args.length == 0) return "";
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < args.length; i++) {
-            if (i > 0) sb.append(", ");
-            sb.append(args[i]);
-        }
-        return sb.toString();
-    }
-
     static final class StatementHandler implements InvocationHandler {
         private final Statement delegate;
         private final String catalogPrefix;
@@ -260,7 +245,6 @@ public class InformixWrapperDriver implements Driver {
         @Override
         public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
             String name = method.getName();
-            System.err.println("[InformixWrapper] Statement." + name + "(" + argsStr(args) + ")");
             // Intercept all SQL execution methods that accept a raw SQL string as first arg.
             // DBeaver calls Statement.execute(sql) for every query it runs.
             if (catalogPrefix != null && args != null && args.length > 0 && args[0] instanceof String
@@ -269,9 +253,7 @@ public class InformixWrapperDriver implements Driver {
                 args = rewriteSqlArg(args, catalogPrefix, "Statement." + name);
             }
             try {
-                Object result = method.invoke(delegate, args);
-                System.err.println("[InformixWrapper] Statement." + name + " → OK");
-                return result;
+                return method.invoke(delegate, args);
             } catch (InvocationTargetException e) {
                 System.err.println("[InformixWrapper] Statement." + name + " FAILED: " + e.getCause());
                 throw e.getCause();
@@ -292,19 +274,14 @@ public class InformixWrapperDriver implements Driver {
             // Return a space (JDBC convention: "no quoting") so Trino generates unquoted SQL
             // identifiers that Informix accepts natively, instead of double-quoted ones.
             if ("getIdentifierQuoteString".equals(name) && (args == null || args.length == 0)) {
-                System.err.println("[InformixWrapper] meta.getIdentifierQuoteString() → \" \" (override)");
                 return " ";
             }
-            System.err.println("[InformixWrapper] meta." + name + "(" + argsStr(args) + ")");
             try {
-                Object result = method.invoke(delegate, args);
-                System.err.println("[InformixWrapper] meta." + name + " → OK");
-                return result;
+                return method.invoke(delegate, args);
             } catch (InvocationTargetException e) {
                 System.err.println("[InformixWrapper] meta." + name + " FAILED: " + e.getCause());
                 throw e.getCause();
             }
         }
-
     }
 }
