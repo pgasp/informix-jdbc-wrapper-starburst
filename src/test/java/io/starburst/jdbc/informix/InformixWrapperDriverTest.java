@@ -146,13 +146,6 @@ class InformixWrapperDriverTest {
     }
 
     @Test
-    void wrapDatabaseMetaData_getIdentifierQuoteString_returnsSpace() throws SQLException {
-        DatabaseMetaData wrapped = InformixWrapperDriver.wrapDatabaseMetaData(stubMeta());
-        assertEquals(" ", wrapped.getIdentifierQuoteString(),
-                "Must return a space so Trino generates unquoted SQL identifiers");
-    }
-
-    @Test
     void wrapConnection_getMetaData_returnsWrappedProxy() throws SQLException {
         DatabaseMetaData innerMeta = stubMeta();
         Connection mockConn = (Connection) Proxy.newProxyInstance(

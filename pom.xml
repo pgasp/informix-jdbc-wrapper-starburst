@@ -6,7 +6,7 @@
 
     <groupId>io.starburst.jdbc</groupId>
     <artifactId>informix-jdbc-wrapper</artifactId>
-    <version>1.6.0</version>
+    <version>1.6.1</version>
     <packaging>jar</packaging>
 
     <name>Informix JDBC Wrapper for Starburst</name>
@@ -29,6 +29,22 @@
             <artifactId>jdbc</artifactId>
             <version>4.10.13</version>
             <scope>provided</scope>
+        </dependency>
+
+        <!-- SLF4J API — provided by Trino/SEP runtime and DBeaver; never bundle the binding -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>2.0.13</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- SLF4J simple binding for unit tests only -->
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <version>2.0.13</version>
+            <scope>test</scope>
         </dependency>
 
         <dependency>

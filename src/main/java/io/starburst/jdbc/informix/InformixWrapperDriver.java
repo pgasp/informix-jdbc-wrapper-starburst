@@ -1,5 +1,8 @@
 package io.starburst.jdbc.informix;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
@@ -13,16 +16,11 @@ import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
 import java.sql.Statement;
 import java.util.Properties;
-import java.util.logging.Logger;
 
 /**
  * Accepts jdbc:informix: URLs and rewrites them to jdbc:informix-sqli: before
  * delegating to the IBM IfxDriver. This bypasses Starburst Enterprise's
  * BaseJdbcConfig URL validation which rejects hyphens in the JDBC sub-protocol.
- *
- * Also wraps Connection.getMetaData() to override getIdentifierQuoteString() — returning
- * a space character (the JDBC convention for "no quoting supported") so that Trino's
- * generic-jdbc generates unquoted SQL identifiers, which Informix accepts natively.
  *
  * Rewrites prepareStatement SQL to strip the catalog prefix (e.g. "syn11.") that Trino
  * adds based on TABLE_CAT returned by the IBM driver metadata. Informix does not accept
@@ -30,7 +28,7 @@ import java.util.logging.Logger;
  * (catalog:schema.table). Since the catalog is already set as the default database in
  * the connection URL, stripping the prefix is safe and produces valid Informix SQL.
  *
- * Starburst generates double-quoted identifiers regardless of getIdentifierQuoteString(),
+ * Starburst hardcodes double-quote as the identifier quote character in GenericJdbcClient,
  * so both unquoted (syn11.) and double-quoted ("syn11".) catalog prefixes are stripped.
  *
  * SEP catalog-values.yaml example:
@@ -39,6 +37,8 @@ import java.util.logging.Logger;
  *   connection-url=jdbc:informix://host:port/database:INFORMIXSERVER=server_name
  */
 public class InformixWrapperDriver implements Driver {
+
+    private static final Logger log = LoggerFactory.getLogger(InformixWrapperDriver.class);
 
     private static final String WRAPPER_PREFIX = "jdbc:informix:";
     private static final String IBM_PREFIX = "jdbc:informix-sqli:";
@@ -51,13 +51,13 @@ public class InformixWrapperDriver implements Driver {
                     .getDeclaredConstructor()
                     .newInstance();
             DriverManager.registerDriver(new InformixWrapperDriver());
-            System.err.println("[InformixWrapper] v1.6.0 IBM IfxDriver loaded OK");
+            log.info("v1.6.1 IBM IfxDriver loaded OK");
         } catch (ClassNotFoundException e) {
-            System.err.println("[InformixWrapper] FATAL: IBM IfxDriver not found in classpath: " + e.getMessage());
+            log.error("FATAL: IBM IfxDriver not found in classpath: {}", e.getMessage());
             throw new ExceptionInInitializerError(
                     "IBM Informix JDBC driver (ifxjdbc.jar) not found in classpath: " + e.getMessage());
         } catch (Exception e) {
-            System.err.println("[InformixWrapper] FATAL: init failed: " + e);
+            log.error("FATAL: init failed", e);
             throw new ExceptionInInitializerError(e);
         }
     }
@@ -113,10 +113,10 @@ public class InformixWrapperDriver implements Driver {
             return null;
         }
         String database = extractDatabase(url);
-        System.err.println("[InformixWrapper] connect() database=" + database + " url=" + maskUrl(url));
+        log.info("connect() database={} url={}", database, maskUrl(url));
         Connection conn = IBM_DRIVER.connect(rewrite(url), info);
         if (conn == null) {
-            System.err.println("[InformixWrapper] connect() → null (IBM driver rejected URL)");
+            log.warn("connect() → null (IBM driver rejected URL)");
             return null;
         }
         return wrapConnection(conn, database);
@@ -153,7 +153,7 @@ public class InformixWrapperDriver implements Driver {
     }
 
     @Override
-    public Logger getParentLogger() throws SQLFeatureNotSupportedException {
+    public java.util.logging.Logger getParentLogger() throws SQLFeatureNotSupportedException {
         throw new SQLFeatureNotSupportedException("java.util.logging not used");
     }
 
@@ -210,7 +210,7 @@ public class InformixWrapperDriver implements Driver {
             try {
                 return method.invoke(delegate, args);
             } catch (InvocationTargetException e) {
-                System.err.println("[InformixWrapper] Connection." + name + " FAILED: " + e.getCause());
+                log.error("Connection.{} FAILED", name, e.getCause());
                 throw e.getCause();
             }
         }
@@ -218,7 +218,8 @@ public class InformixWrapperDriver implements Driver {
 
     // Rewrites args[0] (SQL string) by stripping the catalog prefix.
     // Handles both unquoted (syn11.) and double-quoted ("syn11".) forms — Starburst
-    // generates double-quoted identifiers regardless of getIdentifierQuoteString().
+    // hardcodes double-quote as identifier quote in GenericJdbcClient regardless of
+    // what DatabaseMetaData.getIdentifierQuoteString() returns.
     private static Object[] rewriteSqlArg(Object[] args, String catalogPrefix, String methodName) {
         String sql = (String) args[0];
         // catalogPrefix = "syn11." — strip quoted form first, then unquoted fallback
@@ -226,7 +227,7 @@ public class InformixWrapperDriver implements Driver {
         String quotedPrefix = "\"" + dbName + "\".";
         String rewritten = sql.replace(quotedPrefix, "").replace(catalogPrefix, "");
         if (!rewritten.equals(sql)) {
-            System.err.println("[InformixWrapper] " + methodName + " stripped catalog prefix '" + catalogPrefix + "': " + rewritten);
+            log.info("{} stripped catalog prefix '{}': {}", methodName, catalogPrefix, rewritten);
             args = args.clone();
             args[0] = rewritten;
         }
@@ -255,7 +256,7 @@ public class InformixWrapperDriver implements Driver {
             try {
                 return method.invoke(delegate, args);
             } catch (InvocationTargetException e) {
-                System.err.println("[InformixWrapper] Statement." + name + " FAILED: " + e.getCause());
+                log.error("Statement.{} FAILED", name, e.getCause());
                 throw e.getCause();
             }
         }
@@ -270,16 +271,10 @@ public class InformixWrapperDriver implements Driver {
 
         @Override
         public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
-            String name = method.getName();
-            // Return a space (JDBC convention: "no quoting") so Trino generates unquoted SQL
-            // identifiers that Informix accepts natively, instead of double-quoted ones.
-            if ("getIdentifierQuoteString".equals(name) && (args == null || args.length == 0)) {
-                return " ";
-            }
             try {
                 return method.invoke(delegate, args);
             } catch (InvocationTargetException e) {
-                System.err.println("[InformixWrapper] meta." + name + " FAILED: " + e.getCause());
+                log.error("meta.{} FAILED", method.getName(), e.getCause());
                 throw e.getCause();
             }
         }
