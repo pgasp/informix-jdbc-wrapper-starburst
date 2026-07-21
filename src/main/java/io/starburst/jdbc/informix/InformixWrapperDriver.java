@@ -20,8 +20,10 @@ import java.sql.SQLFeatureNotSupportedException;
 import java.sql.Statement;
 import java.util.Arrays;
 import java.util.LinkedHashSet;
+import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Accepts jdbc:informix: URLs and rewrites them to jdbc:informix-sqli: before
@@ -57,7 +59,7 @@ public class InformixWrapperDriver implements Driver {
                     .getDeclaredConstructor()
                     .newInstance();
             DriverManager.registerDriver(new InformixWrapperDriver());
-            log.info("v1.7.5 IBM IfxDriver loaded OK");
+            log.info("v1.7.6 IBM IfxDriver loaded OK");
         } catch (ClassNotFoundException e) {
             log.error("FATAL: IBM IfxDriver not found in classpath: {}", e.getMessage());
             throw new ExceptionInInitializerError(
@@ -334,6 +336,9 @@ public class InformixWrapperDriver implements Driver {
 
     static final class DatabaseMetaDataHandler implements InvocationHandler {
         private final DatabaseMetaData delegate;
+        // Cache of synonym column metadata rows, keyed by "schema|table".
+        // Avoids re-executing SELECT * WHERE 1=0 on every getColumns() call for the same synonym.
+        private final Map<String, String[][]> columnCache = new ConcurrentHashMap<>();
 
         DatabaseMetaDataHandler(DatabaseMetaData delegate) {
             this.delegate = delegate;
@@ -466,12 +471,20 @@ public class InformixWrapperDriver implements Driver {
         // so this succeeds where DatabaseMetaData.getColumns() returns 0 rows.
         // NOTE: "SELECT FIRST 0 *" is invalid Informix syntax — FIRST requires N >= 1.
         // We use WHERE 1=0 instead to get 0 rows without a FIRST clause.
-        // Attempts three SQL forms in order to handle DELIMIDENT=y and reserved owner names
-        // (e.g. "informix" is the Informix system owner and may be reserved in some contexts):
+        // Results are cached in columnCache (keyed by "schema|table") so the query runs at most
+        // once per synonym per DatabaseMetaData instance (i.e. per connection lifetime).
+        // Three SQL forms are tried in order to handle DELIMIDENT=y and reserved owner names:
         //   1. schema.table       — standard unquoted owner.tablename
         //   2. "schema"."table"   — fully quoted (DELIMIDENT=y safe)
         //   3. table              — no schema prefix (relies on connection database context)
         private ResultSet buildColumnsFromQuery(String schema, String table) {
+            String cacheKey = (schema != null ? schema : "") + "|" + table;
+            String[][] cached = columnCache.get(cacheKey);
+            if (cached != null) {
+                log.debug("buildColumnsFromQuery: cache hit for {} ({} column(s))", cacheKey, cached.length);
+                return syntheticColumnsResultSet(cached);
+            }
+
             boolean hasSchema = schema != null && !schema.isEmpty();
             String[] candidates;
             if (hasSchema) {
@@ -490,28 +503,40 @@ public class InformixWrapperDriver implements Driver {
                      ResultSet rs = ps.executeQuery()) {
                     ResultSetMetaData rsmd = rs.getMetaData();
                     int count = rsmd.getColumnCount();
-                    log.debug("buildColumnsFromQuery: RSMD returned {} column(s) for {}", count, qualified);
+                    // Log full RSMD dump — catalog/schema/table fields confirm the synonym chain
+                    // was followed by the SQL engine, and help diagnose type mapping issues.
+                    log.debug("buildColumnsFromQuery: RSMD for '{}' — {} column(s)", qualified, count);
                     String[][] rows = new String[count][];
                     for (int i = 1; i <= count; i++) {
-                        String colName   = rsmd.getColumnName(i);
-                        int    sqlType   = rsmd.getColumnType(i);
-                        String typeName  = rsmd.getColumnTypeName(i);
-                        int    precision = rsmd.getPrecision(i);
-                        int    scale     = rsmd.getScale(i);
-                        String nullable  = rsmd.isNullable(i) == ResultSetMetaData.columnNoNulls ? "NO" : "YES";
-                        String autoInc   = rsmd.isAutoIncrement(i) ? "YES" : "NO";
-                        log.debug("  col[{}]: name={} sqlType={} typeName={} size={} scale={} nullable={} autoInc={}",
-                                i, colName, sqlType, typeName, precision, scale, nullable, autoInc);
-                        rows[i - 1] = new String[]{
+                        final int col = i;
+                        String colName    = rsmd.getColumnName(col);
+                        String colLabel   = safeGet(() -> rsmd.getColumnLabel(col));
+                        int    sqlType    = rsmd.getColumnType(col);
+                        String typeName   = rsmd.getColumnTypeName(col);
+                        int    precision  = rsmd.getPrecision(col);
+                        int    scale      = rsmd.getScale(col);
+                        String displaySz  = safeGet(() -> String.valueOf(rsmd.getColumnDisplaySize(col)));
+                        String nullable   = rsmd.isNullable(col) == ResultSetMetaData.columnNoNulls ? "NO" : "YES";
+                        String autoInc    = rsmd.isAutoIncrement(col) ? "YES" : "NO";
+                        String srcCatalog = safeGet(() -> rsmd.getCatalogName(col));
+                        String srcSchema  = safeGet(() -> rsmd.getSchemaName(col));
+                        String srcTable   = safeGet(() -> rsmd.getTableName(col));
+                        log.debug(
+                            "  col[{}] name={} label={} sqlType={} typeName={} precision={} scale={}" +
+                            " displaySize={} nullable={} autoInc={} src={}.{}.{}",
+                            col, colName, colLabel, sqlType, typeName, precision, scale,
+                            displaySz, nullable, autoInc, srcCatalog, srcSchema, srcTable);
+                        rows[col - 1] = new String[]{
                             colName, String.valueOf(sqlType), typeName,
                             String.valueOf(precision), String.valueOf(scale),
-                            String.valueOf(i), nullable, autoInc
+                            String.valueOf(col), nullable, autoInc
                         };
                     }
                     if (count == 0) {
-                        log.warn("buildColumnsFromQuery: query succeeded but returned 0 columns for {} — synonym may not be accessible", qualified);
+                        log.warn("buildColumnsFromQuery: query succeeded but 0 columns for {} — synonym may not be accessible", qualified);
                     } else {
-                        log.info("buildColumnsFromQuery: built synthetic ResultSet with {} column(s) for {} (form: '{}')", count, qualified, querySql);
+                        log.info("buildColumnsFromQuery: {} column(s) for {} via '{}' — caching", count, cacheKey, querySql);
+                        columnCache.put(cacheKey, rows);
                     }
                     return syntheticColumnsResultSet(rows);
                 } catch (Exception e) {
@@ -521,6 +546,15 @@ public class InformixWrapperDriver implements Driver {
             log.warn("buildColumnsFromQuery({}.{}): all SQL forms failed — synonym columns unavailable", schema, table);
             return null;
         }
+
+        // Calls a supplier that may throw a checked exception; returns the value or "?" on error.
+        // Used for optional RSMD fields (catalog/schema/table) that some drivers don't implement.
+        private static String safeGet(SqlSupplier<String> s) {
+            try { return s.get(); } catch (Exception e) { return "?"; }
+        }
+
+        @FunctionalInterface
+        interface SqlSupplier<T> { T get() throws Exception; }
 
         private static Object[] expandTypesWithSynonym(Object[] args) {
             String[] types = (String[]) args[3];
