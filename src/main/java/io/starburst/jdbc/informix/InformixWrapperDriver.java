@@ -14,6 +14,7 @@ import java.sql.DriverManager;
 import java.sql.DriverPropertyInfo;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
 import java.sql.Statement;
@@ -56,7 +57,7 @@ public class InformixWrapperDriver implements Driver {
                     .getDeclaredConstructor()
                     .newInstance();
             DriverManager.registerDriver(new InformixWrapperDriver());
-            log.info("v1.7.1 IBM IfxDriver loaded OK");
+            log.info("v1.7.2 IBM IfxDriver loaded OK");
         } catch (ClassNotFoundException e) {
             log.error("FATAL: IBM IfxDriver not found in classpath: {}", e.getMessage());
             throw new ExceptionInInitializerError(
@@ -174,6 +175,48 @@ public class InformixWrapperDriver implements Driver {
                 InformixWrapperDriver.class.getClassLoader(),
                 new Class<?>[] {DatabaseMetaData.class},
                 new DatabaseMetaDataHandler(meta));
+    }
+
+    // Builds an in-memory ResultSet that satisfies DatabaseMetaData.getColumns() column contract.
+    // Only the columns that BaseJdbcClient reads are mapped; unknown keys return null/0.
+    static ResultSet syntheticColumnsResultSet(String[][] rows) {
+        int[] cursor = {-1};
+        return (ResultSet) Proxy.newProxyInstance(
+                InformixWrapperDriver.class.getClassLoader(),
+                new Class<?>[] {ResultSet.class},
+                (proxy, method, args) -> {
+                    switch (method.getName()) {
+                        case "next":    return ++cursor[0] < rows.length;
+                        case "close":   return null;
+                        case "wasNull": return Boolean.FALSE;
+                        case "getString": {
+                            int idx = colIdx(args[0]);
+                            return idx >= 0 ? rows[cursor[0]][idx] : null;
+                        }
+                        case "getInt": {
+                            int idx = colIdx(args[0]);
+                            return idx >= 0 ? Integer.parseInt(rows[cursor[0]][idx]) : 0;
+                        }
+                        default:
+                            throw new UnsupportedOperationException("syntheticColumnsResultSet: " + method.getName());
+                    }
+                });
+    }
+
+    private static int colIdx(Object key) {
+        if (key instanceof String) {
+            switch (((String) key).toUpperCase()) {
+                case "COLUMN_NAME":      return 0;
+                case "DATA_TYPE":        return 1;
+                case "TYPE_NAME":        return 2;
+                case "COLUMN_SIZE":      return 3;
+                case "DECIMAL_DIGITS":   return 4;
+                case "ORDINAL_POSITION": return 5;
+                case "IS_NULLABLE":      return 6;
+                case "IS_AUTOINCREMENT": return 7;
+            }
+        }
+        return -1;
     }
 
     static ResultSet wrapGetTablesResultSet(ResultSet rs) {
@@ -297,18 +340,27 @@ public class InformixWrapperDriver implements Driver {
                 }
             }
             // getColumns: resolve synonyms before delegating. The IBM driver does not follow
-            // the synonym chain when returning column metadata, yielding 0 columns. We look up
-            // the underlying table in syssyntable first and redirect the call to it.
+            // the synonym chain when returning column metadata, yielding 0 columns.
+            // Two strategies, in order:
+            // 1. syssyntable JOIN — works for local (same-database) synonyms
+            // 2. SELECT FIRST 0 * fallback — for cross-database synonyms where btabid maps to
+            //    a table in another database, Informix's SQL engine follows the chain but the
+            //    JDBC metadata API does not. We detect this via systables.tabtype='S' and build
+            //    a synthetic ResultSet from ResultSetMetaData.
             if ("getColumns".equals(method.getName()) && args != null && args.length == 4) {
                 String schema = (String) args[1];
                 String table  = (String) args[2];
                 if (table != null && !table.contains("%")) {
                     String[] resolved = resolveSynonymTarget(schema, table);
                     if (resolved != null) {
-                        log.info("getColumns: synonym {}.{} resolved to {}.{}", schema, table, resolved[0], resolved[1]);
+                        log.info("getColumns: local synonym {}.{} → {}.{}", schema, table, resolved[0], resolved[1]);
                         args = args.clone();
                         args[1] = resolved[0];
                         args[2] = resolved[1];
+                    } else if (isSynonymInSystemCatalog(schema, table)) {
+                        log.info("getColumns: cross-database synonym {}.{} → SELECT FIRST 0 fallback", schema, table);
+                        ResultSet synthetic = buildColumnsFromQuery(schema, table);
+                        if (synthetic != null) return synthetic;
                     }
                 }
             }
@@ -339,6 +391,51 @@ public class InformixWrapperDriver implements Driver {
                 log.warn("resolveSynonymTarget({}.{}): {}", schema, table, e.getMessage());
             }
             return null;
+        }
+
+        // Checks systables alone (no join) — true for both local and cross-database synonyms.
+        private boolean isSynonymInSystemCatalog(String schema, String table) {
+            String sql = "SELECT 1 FROM informix.systables WHERE tabname = ? AND tabtype = 'S'" +
+                         (schema != null ? " AND owner = ?" : "");
+            try (PreparedStatement ps = delegate.getConnection().prepareStatement(sql)) {
+                ps.setString(1, table);
+                if (schema != null) ps.setString(2, schema);
+                try (ResultSet rs = ps.executeQuery()) {
+                    return rs.next();
+                }
+            } catch (Exception e) {
+                log.warn("isSynonymInSystemCatalog({}.{}): {}", schema, table, e.getMessage());
+                return false;
+            }
+        }
+
+        // Executes "SELECT FIRST 0 *" and builds a synthetic getColumns() ResultSet from RSMD.
+        // Informix follows the synonym chain at the SQL level even for cross-database synonyms,
+        // so this succeeds where DatabaseMetaData.getColumns() returns 0 rows.
+        private ResultSet buildColumnsFromQuery(String schema, String table) {
+            String qualified = (schema != null && !schema.isEmpty()) ? schema + "." + table : table;
+            try (PreparedStatement ps = delegate.getConnection().prepareStatement("SELECT FIRST 0 * FROM " + qualified);
+                 ResultSet rs = ps.executeQuery()) {
+                ResultSetMetaData rsmd = rs.getMetaData();
+                int count = rsmd.getColumnCount();
+                String[][] rows = new String[count][];
+                for (int i = 1; i <= count; i++) {
+                    rows[i - 1] = new String[]{
+                        rsmd.getColumnName(i),
+                        String.valueOf(rsmd.getColumnType(i)),
+                        rsmd.getColumnTypeName(i),
+                        String.valueOf(rsmd.getPrecision(i)),
+                        String.valueOf(rsmd.getScale(i)),
+                        String.valueOf(i),
+                        rsmd.isNullable(i) == ResultSetMetaData.columnNoNulls ? "NO" : "YES",
+                        rsmd.isAutoIncrement(i) ? "YES" : "NO"
+                    };
+                }
+                return syntheticColumnsResultSet(rows);
+            } catch (Exception e) {
+                log.warn("buildColumnsFromQuery({}.{}): {}", schema, table, e.getMessage());
+                return null;
+            }
         }
 
         private static Object[] expandTypesWithSynonym(Object[] args) {

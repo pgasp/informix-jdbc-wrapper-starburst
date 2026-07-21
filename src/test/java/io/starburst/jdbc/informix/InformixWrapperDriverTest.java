@@ -11,6 +11,7 @@ import java.sql.DatabaseMetaData;
 import java.sql.DriverPropertyInfo;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
 import java.sql.Statement;
@@ -439,6 +440,168 @@ class InformixWrapperDriverTest {
         // Args must pass through unchanged — no resolution attempted
         assertEquals("informix", cap.capturedSchema);
         assertEquals("s_%",      cap.capturedTable);
+    }
+
+    // --- getColumns: cross-database synonym fallback (SELECT FIRST 0 *) ---
+
+    /**
+     * Connection that routes prepareStatement() calls by SQL content:
+     * - syssyntable JOIN → empty (cross-db: btabid not in local systables)
+     * - systables tabtype check → one row (it IS a synonym)
+     * - SELECT FIRST 0 * → ResultSet with 2-column ResultSetMetaData
+     */
+    private static Connection crossDbSynonymConnection() {
+        return (Connection) Proxy.newProxyInstance(
+                InformixWrapperDriverTest.class.getClassLoader(),
+                new Class<?>[] {Connection.class},
+                (p, method, args) -> {
+                    if ("prepareStatement".equals(method.getName())) {
+                        String sql = (String) args[0];
+                        if (sql.contains("syssyntable")) return emptyPs();       // JOIN fails for cross-db
+                        if (sql.contains("tabtype"))     return synonymCheckPs(); // IS a synonym
+                        if (sql.contains("FIRST 0"))     return first0Ps();       // column discovery
+                    }
+                    throw new UnsupportedOperationException(method.getName());
+                });
+    }
+
+    private static PreparedStatement emptyPs() {
+        return (PreparedStatement) Proxy.newProxyInstance(
+                InformixWrapperDriverTest.class.getClassLoader(),
+                new Class<?>[] {PreparedStatement.class},
+                (p, method, args) -> {
+                    if ("setString".equals(method.getName()))  return null;
+                    if ("executeQuery".equals(method.getName())) return emptyResultSet();
+                    if ("close".equals(method.getName()))      return null;
+                    throw new UnsupportedOperationException(method.getName());
+                });
+    }
+
+    private static PreparedStatement synonymCheckPs() {
+        boolean[] consumed = {false};
+        return (PreparedStatement) Proxy.newProxyInstance(
+                InformixWrapperDriverTest.class.getClassLoader(),
+                new Class<?>[] {PreparedStatement.class},
+                (p, method, args) -> {
+                    if ("setString".equals(method.getName()))  return null;
+                    if ("close".equals(method.getName()))      return null;
+                    if ("executeQuery".equals(method.getName())) {
+                        return (ResultSet) Proxy.newProxyInstance(
+                                InformixWrapperDriverTest.class.getClassLoader(),
+                                new Class<?>[] {ResultSet.class},
+                                (p2, m2, a2) -> {
+                                    if ("next".equals(m2.getName())) {
+                                        if (!consumed[0]) { consumed[0] = true; return Boolean.TRUE; }
+                                        return Boolean.FALSE;
+                                    }
+                                    if ("close".equals(m2.getName())) return null;
+                                    throw new UnsupportedOperationException(m2.getName());
+                                });
+                    }
+                    throw new UnsupportedOperationException(method.getName());
+                });
+    }
+
+    /** PreparedStatement for "SELECT FIRST 0 *" — returns a RS with 2-column RSMD. */
+    private static PreparedStatement first0Ps() {
+        return (PreparedStatement) Proxy.newProxyInstance(
+                InformixWrapperDriverTest.class.getClassLoader(),
+                new Class<?>[] {PreparedStatement.class},
+                (p, method, args) -> {
+                    if ("setString".equals(method.getName())) return null;
+                    if ("close".equals(method.getName()))     return null;
+                    if ("executeQuery".equals(method.getName())) return twoColumnResultSet();
+                    throw new UnsupportedOperationException(method.getName());
+                });
+    }
+
+    private static ResultSet twoColumnResultSet() {
+        ResultSetMetaData rsmd = (ResultSetMetaData) Proxy.newProxyInstance(
+                InformixWrapperDriverTest.class.getClassLoader(),
+                new Class<?>[] {ResultSetMetaData.class},
+                (p, method, args) -> {
+                    switch (method.getName()) {
+                        case "getColumnCount":    return 2;
+                        case "getColumnName":     return (int) args[0] == 1 ? "col_id" : "col_name";
+                        case "getColumnType":     return (int) args[0] == 1 ? java.sql.Types.INTEGER : java.sql.Types.VARCHAR;
+                        case "getColumnTypeName": return (int) args[0] == 1 ? "INTEGER" : "VARCHAR";
+                        case "getPrecision":      return (int) args[0] == 1 ? 10 : 255;
+                        case "getScale":          return 0;
+                        case "isNullable":        return ResultSetMetaData.columnNullable;
+                        case "isAutoIncrement":   return Boolean.FALSE;
+                        default: throw new UnsupportedOperationException(method.getName());
+                    }
+                });
+        return (ResultSet) Proxy.newProxyInstance(
+                InformixWrapperDriverTest.class.getClassLoader(),
+                new Class<?>[] {ResultSet.class},
+                (p, method, args) -> {
+                    if ("next".equals(method.getName()))        return Boolean.FALSE; // 0 rows
+                    if ("getMetaData".equals(method.getName())) return rsmd;
+                    if ("close".equals(method.getName()))       return null;
+                    throw new UnsupportedOperationException(method.getName());
+                });
+    }
+
+    @Test
+    void getColumns_crossDatabaseSynonym_buildsSyntheticResultSetFromRSMD() throws Exception {
+        // DatabaseMetaData that has no local synonym resolution but IS a synonym → FIRST 0 path
+        DatabaseMetaData meta = (DatabaseMetaData) Proxy.newProxyInstance(
+                InformixWrapperDriverTest.class.getClassLoader(),
+                new Class<?>[] {DatabaseMetaData.class},
+                (p, method, args) -> {
+                    if ("getColumns".equals(method.getName()))    return emptyResultSet(); // should NOT be reached
+                    if ("getConnection".equals(method.getName())) return crossDbSynonymConnection();
+                    throw new UnsupportedOperationException(method.getName());
+                });
+
+        DatabaseMetaData wrapped = InformixWrapperDriver.wrapDatabaseMetaData(meta);
+        ResultSet rs = wrapped.getColumns(null, "informix", "s_mode_pe", null);
+
+        // Verify synthetic ResultSet returns the two columns from RSMD
+        assertTrue(rs.next());
+        assertEquals("col_id",   rs.getString("COLUMN_NAME"));
+        assertEquals("INTEGER",  rs.getString("TYPE_NAME"));
+        assertEquals(java.sql.Types.INTEGER, rs.getInt("DATA_TYPE"));
+
+        assertTrue(rs.next());
+        assertEquals("col_name", rs.getString("COLUMN_NAME"));
+        assertEquals("VARCHAR",  rs.getString("TYPE_NAME"));
+
+        assertFalse(rs.next());
+    }
+
+    // --- syntheticColumnsResultSet unit tests ---
+
+    @Test
+    void syntheticColumnsResultSet_iteratesRowsCorrectly() throws Exception {
+        String[][] rows = {
+            {"id",   String.valueOf(java.sql.Types.INTEGER), "INTEGER", "10", "0", "1", "NO",  "NO"},
+            {"name", String.valueOf(java.sql.Types.VARCHAR), "VARCHAR", "255","0", "2", "YES", "NO"}
+        };
+        ResultSet rs = InformixWrapperDriver.syntheticColumnsResultSet(rows);
+
+        assertTrue(rs.next());
+        assertEquals("id",      rs.getString("COLUMN_NAME"));
+        assertEquals("INTEGER", rs.getString("TYPE_NAME"));
+        assertEquals(10,        rs.getInt("COLUMN_SIZE"));
+        assertEquals(1,         rs.getInt("ORDINAL_POSITION"));
+        assertEquals("NO",      rs.getString("IS_NULLABLE"));
+
+        assertTrue(rs.next());
+        assertEquals("name",    rs.getString("COLUMN_NAME"));
+        assertEquals(255,       rs.getInt("COLUMN_SIZE"));
+
+        assertFalse(rs.next());
+    }
+
+    @Test
+    void syntheticColumnsResultSet_unknownColumn_returnsNullOrZero() throws Exception {
+        String[][] rows = {{"col", "4", "INTEGER", "10", "0", "1", "YES", "NO"}};
+        ResultSet rs = InformixWrapperDriver.syntheticColumnsResultSet(rows);
+        rs.next();
+        assertNull(rs.getString("REMARKS"));  // unknown → null
+        assertEquals(0, rs.getInt("BUFFER_LENGTH")); // unknown → 0
     }
 
     @Test
