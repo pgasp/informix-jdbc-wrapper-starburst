@@ -59,7 +59,7 @@ public class InformixWrapperDriver implements Driver {
                     .getDeclaredConstructor()
                     .newInstance();
             DriverManager.registerDriver(new InformixWrapperDriver());
-            log.info("v1.7.8 IBM IfxDriver loaded OK");
+            log.info("v1.7.9 IBM IfxDriver loaded OK");
         } catch (ClassNotFoundException e) {
             log.error("FATAL: IBM IfxDriver not found in classpath: {}", e.getMessage());
             throw new ExceptionInInitializerError(
@@ -174,11 +174,11 @@ public class InformixWrapperDriver implements Driver {
                 new ConnectionHandler(conn, database));
     }
 
-    static DatabaseMetaData wrapDatabaseMetaData(DatabaseMetaData meta) {
+    static DatabaseMetaData wrapDatabaseMetaData(DatabaseMetaData meta, Map<String, String[][]> synonymColumnCache) {
         return (DatabaseMetaData) Proxy.newProxyInstance(
                 InformixWrapperDriver.class.getClassLoader(),
                 new Class<?>[] {DatabaseMetaData.class},
-                new DatabaseMetaDataHandler(meta));
+                new DatabaseMetaDataHandler(meta, synonymColumnCache));
     }
 
     // Builds an in-memory ResultSet that satisfies DatabaseMetaData.getColumns() column contract.
@@ -257,6 +257,9 @@ public class InformixWrapperDriver implements Driver {
     static final class ConnectionHandler implements InvocationHandler {
         private final Connection delegate;
         private final String catalogPrefix; // e.g. "syn11." — null if database not in URL
+        // Shared across all DatabaseMetaData instances from this connection so that
+        // SELECT * WHERE 1=0 runs at most once per synonym for the connection's lifetime.
+        private final Map<String, String[][]> synonymColumnCache = new ConcurrentHashMap<>();
 
         ConnectionHandler(Connection delegate, String database) {
             this.delegate = delegate;
@@ -268,7 +271,7 @@ public class InformixWrapperDriver implements Driver {
             String name = method.getName();
             if ("getMetaData".equals(name) && (args == null || args.length == 0)) {
                 log.debug("Connection.getMetaData() → wrapping DatabaseMetaData");
-                return wrapDatabaseMetaData(delegate.getMetaData());
+                return wrapDatabaseMetaData(delegate.getMetaData(), synonymColumnCache);
             }
             // Strip catalog prefix from SQL: Trino generates "syn11.schema.table" based on
             // TABLE_CAT returned by IBM metadata, but Informix only accepts "schema.table"
@@ -345,12 +348,14 @@ public class InformixWrapperDriver implements Driver {
 
     static final class DatabaseMetaDataHandler implements InvocationHandler {
         private final DatabaseMetaData delegate;
-        // Cache of synonym column metadata rows, keyed by "schema|table".
-        // Avoids re-executing SELECT * WHERE 1=0 on every getColumns() call for the same synonym.
-        private final Map<String, String[][]> columnCache = new ConcurrentHashMap<>();
+        // Injected from ConnectionHandler — shared across all DatabaseMetaData instances
+        // on the same connection, so SELECT * WHERE 1=0 runs at most once per synonym
+        // per connection lifetime (not per getMetaData() call).
+        private final Map<String, String[][]> columnCache;
 
-        DatabaseMetaDataHandler(DatabaseMetaData delegate) {
+        DatabaseMetaDataHandler(DatabaseMetaData delegate, Map<String, String[][]> columnCache) {
             this.delegate = delegate;
+            this.columnCache = columnCache;
         }
 
         @Override

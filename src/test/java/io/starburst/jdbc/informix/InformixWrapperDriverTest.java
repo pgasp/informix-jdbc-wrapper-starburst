@@ -19,6 +19,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Properties;
+import java.util.concurrent.ConcurrentHashMap;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -236,7 +237,7 @@ class InformixWrapperDriverTest {
     @Test
     void getTables_nullTypes_addsSynonym() throws Exception {
         CapturingMeta cap = new CapturingMeta();
-        DatabaseMetaData wrapped = InformixWrapperDriver.wrapDatabaseMetaData(cap.proxy());
+        DatabaseMetaData wrapped = InformixWrapperDriver.wrapDatabaseMetaData(cap.proxy(), new ConcurrentHashMap<>());
 
         wrapped.getTables(null, null, null, null);
 
@@ -249,7 +250,7 @@ class InformixWrapperDriverTest {
     @Test
     void getTables_explicitTableView_addsSynonym() throws Exception {
         CapturingMeta cap = new CapturingMeta();
-        DatabaseMetaData wrapped = InformixWrapperDriver.wrapDatabaseMetaData(cap.proxy());
+        DatabaseMetaData wrapped = InformixWrapperDriver.wrapDatabaseMetaData(cap.proxy(), new ConcurrentHashMap<>());
 
         wrapped.getTables(null, null, null, new String[]{"TABLE", "VIEW"});
 
@@ -262,7 +263,7 @@ class InformixWrapperDriverTest {
     @Test
     void getTables_synonymAlreadyPresent_noDuplicate() throws Exception {
         CapturingMeta cap = new CapturingMeta();
-        DatabaseMetaData wrapped = InformixWrapperDriver.wrapDatabaseMetaData(cap.proxy());
+        DatabaseMetaData wrapped = InformixWrapperDriver.wrapDatabaseMetaData(cap.proxy(), new ConcurrentHashMap<>());
 
         wrapped.getTables(null, null, null, new String[]{"TABLE", "SYNONYM"});
 
@@ -409,7 +410,7 @@ class InformixWrapperDriverTest {
     @Test
     void getColumns_synonym_redirectsToUnderlyingTable() throws Exception {
         CapturingMetaForColumns cap = new CapturingMetaForColumns("s_mode_pe", "informix", "pe_mode");
-        DatabaseMetaData wrapped = InformixWrapperDriver.wrapDatabaseMetaData(cap.proxy());
+        DatabaseMetaData wrapped = InformixWrapperDriver.wrapDatabaseMetaData(cap.proxy(), new ConcurrentHashMap<>());
 
         wrapped.getColumns(null, "informix", "s_mode_pe", null);
 
@@ -421,7 +422,7 @@ class InformixWrapperDriverTest {
     void getColumns_regularTable_passesThrough() throws Exception {
         // synonName=null → no synonym found → args unchanged
         CapturingMetaForColumns cap = new CapturingMetaForColumns(null, null, null);
-        DatabaseMetaData wrapped = InformixWrapperDriver.wrapDatabaseMetaData(cap.proxy());
+        DatabaseMetaData wrapped = InformixWrapperDriver.wrapDatabaseMetaData(cap.proxy(), new ConcurrentHashMap<>());
 
         wrapped.getColumns(null, "inf11adm", "cotisants", null);
 
@@ -433,7 +434,7 @@ class InformixWrapperDriverTest {
     void getColumns_wildcardTable_skipsResolution() throws Exception {
         // Table pattern with % must not trigger synonym resolution
         CapturingMetaForColumns cap = new CapturingMetaForColumns("s_%", "informix", "pe_mode");
-        DatabaseMetaData wrapped = InformixWrapperDriver.wrapDatabaseMetaData(cap.proxy());
+        DatabaseMetaData wrapped = InformixWrapperDriver.wrapDatabaseMetaData(cap.proxy(), new ConcurrentHashMap<>());
 
         wrapped.getColumns(null, "informix", "s_%", null);
 
@@ -570,7 +571,7 @@ class InformixWrapperDriverTest {
         // Trino passes "s\_mode\_pe" (escaped for LIKE) — our wrapper must query systables
         // with the plain name "s_mode_pe" or the exact-match query returns no rows.
         CapturingMetaForColumns cap = new CapturingMetaForColumns("s_mode_pe", "informix", "pe_mode");
-        DatabaseMetaData wrapped = InformixWrapperDriver.wrapDatabaseMetaData(cap.proxy());
+        DatabaseMetaData wrapped = InformixWrapperDriver.wrapDatabaseMetaData(cap.proxy(), new ConcurrentHashMap<>());
 
         // Pass the JDBC-escaped form as Trino would
         wrapped.getColumns(null, "informix", "s\\_mode\\_pe", null);
@@ -592,7 +593,7 @@ class InformixWrapperDriverTest {
                     throw new UnsupportedOperationException(method.getName());
                 });
 
-        DatabaseMetaData wrapped = InformixWrapperDriver.wrapDatabaseMetaData(meta);
+        DatabaseMetaData wrapped = InformixWrapperDriver.wrapDatabaseMetaData(meta, new ConcurrentHashMap<>());
         ResultSet rs = wrapped.getColumns(null, "informix", "s_mode_pe", null);
 
         // Verify synthetic ResultSet returns the two columns from RSMD
@@ -645,7 +646,7 @@ class InformixWrapperDriverTest {
     void getColumns_noSchemaFilter_resolvesWithoutOwnerClause() throws Exception {
         // schema=null → query without AND t1.owner=? clause
         CapturingMetaForColumns cap = new CapturingMetaForColumns("s_mode_pe", "informix", "pe_mode");
-        DatabaseMetaData wrapped = InformixWrapperDriver.wrapDatabaseMetaData(cap.proxy());
+        DatabaseMetaData wrapped = InformixWrapperDriver.wrapDatabaseMetaData(cap.proxy(), new ConcurrentHashMap<>());
 
         wrapped.getColumns(null, null, "s_mode_pe", null);
 
