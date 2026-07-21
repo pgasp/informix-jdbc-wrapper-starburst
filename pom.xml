@@ -6,7 +6,7 @@
 
     <groupId>io.starburst.jdbc</groupId>
     <artifactId>informix-jdbc-wrapper</artifactId>
-    <version>1.7.3</version>
+    <version>1.7.4</version>
     <packaging>jar</packaging>
 
     <name>Informix JDBC Wrapper for Starburst</name>

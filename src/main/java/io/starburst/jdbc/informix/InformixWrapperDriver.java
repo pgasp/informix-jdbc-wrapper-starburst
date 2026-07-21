@@ -57,7 +57,7 @@ public class InformixWrapperDriver implements Driver {
                     .getDeclaredConstructor()
                     .newInstance();
             DriverManager.registerDriver(new InformixWrapperDriver());
-            log.info("v1.7.3 IBM IfxDriver loaded OK");
+            log.info("v1.7.4 IBM IfxDriver loaded OK");
         } catch (ClassNotFoundException e) {
             log.error("FATAL: IBM IfxDriver not found in classpath: {}", e.getMessage());
             throw new ExceptionInInitializerError(
@@ -116,15 +116,17 @@ public class InformixWrapperDriver implements Driver {
     @Override
     public Connection connect(String url, Properties info) throws SQLException {
         if (!acceptsURL(url)) {
+            log.debug("connect() rejected (not our prefix): {}", maskUrl(url));
             return null;
         }
         String database = extractDatabase(url);
         log.info("connect() database={} url={}", database, maskUrl(url));
         Connection conn = IBM_DRIVER.connect(rewrite(url), info);
         if (conn == null) {
-            log.warn("connect() → null (IBM driver rejected URL)");
+            log.warn("connect() → null (IBM driver rejected URL after rewrite)");
             return null;
         }
+        log.debug("connect() IBM driver OK, wrapping connection with catalogPrefix={}", database != null ? database + "." : "none");
         return wrapConnection(conn, database);
     }
 
@@ -254,6 +256,7 @@ public class InformixWrapperDriver implements Driver {
         public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
             String name = method.getName();
             if ("getMetaData".equals(name) && (args == null || args.length == 0)) {
+                log.debug("Connection.getMetaData() → wrapping DatabaseMetaData");
                 return wrapDatabaseMetaData(delegate.getMetaData());
             }
             // Strip catalog prefix from SQL: Trino generates "syn11.schema.table" based on
@@ -267,9 +270,11 @@ public class InformixWrapperDriver implements Driver {
             // Intercept createStatement() and return a wrapped Statement that applies
             // the same catalog prefix rewrite to all SQL execution methods.
             if (name.startsWith("createStatement") && catalogPrefix != null) {
+                log.debug("Connection.createStatement() → wrapping Statement with catalogPrefix={}", catalogPrefix);
                 Statement stmt = (Statement) method.invoke(delegate, args);
                 return stmt == null ? null : wrapStatement(stmt, catalogPrefix);
             }
+            log.debug("Connection.{}() → delegating", name);
             try {
                 return method.invoke(delegate, args);
             } catch (InvocationTargetException e) {
@@ -293,6 +298,8 @@ public class InformixWrapperDriver implements Driver {
             log.info("{} stripped catalog prefix '{}': {}", methodName, catalogPrefix, rewritten);
             args = args.clone();
             args[0] = rewritten;
+        } else {
+            log.debug("{} no catalog prefix to strip (prefix='{}') in: {}", methodName, catalogPrefix, sql);
         }
         return args;
     }
@@ -338,10 +345,20 @@ public class InformixWrapperDriver implements Driver {
             // catalog. The returned ResultSet is wrapped to remap TABLE_TYPE "SYNONYM" → "TABLE"
             // because Starburst filters the result on TABLE_TYPE and only retains TABLE/VIEW.
             if ("getTables".equals(method.getName()) && args != null && args.length == 4) {
+                String[] originalTypes = (String[]) args[3];
+                log.debug("meta.getTables(catalog={} schema={} table={} types={})",
+                        args[0], args[1], args[2],
+                        originalTypes != null ? Arrays.toString(originalTypes) : "null");
                 args = expandTypesWithSynonym(args);
+                log.debug("meta.getTables: expanded types={}", Arrays.toString((String[]) args[3]));
                 try {
                     Object rs = method.invoke(delegate, args);
-                    return rs == null ? null : wrapGetTablesResultSet((ResultSet) rs);
+                    if (rs == null) {
+                        log.warn("meta.getTables: IBM driver returned null ResultSet");
+                        return null;
+                    }
+                    log.debug("meta.getTables: wrapping ResultSet (SYNONYM → TABLE remapping active)");
+                    return wrapGetTablesResultSet((ResultSet) rs);
                 } catch (InvocationTargetException e) {
                     log.error("meta.getTables FAILED", e.getCause());
                     throw e.getCause();
@@ -358,24 +375,39 @@ public class InformixWrapperDriver implements Driver {
             if ("getColumns".equals(method.getName()) && args != null && args.length == 4) {
                 String schema = (String) args[1];
                 String table  = (String) args[2];
+                log.debug("meta.getColumns(catalog={} schema={} table={} colPattern={})",
+                        args[0], schema, table, args[3]);
                 if (table != null && !table.contains("%")) {
                     // Trino escapes the table name for JDBC LIKE pattern matching before passing
                     // it to getColumns() (e.g. "s_mode_pe" → "s\_mode\_pe"). Our system catalog
                     // queries use exact match (=), so we must un-escape first.
                     String plainTable = unescapeMetadataPattern(table);
+                    if (!table.equals(plainTable)) {
+                        log.debug("meta.getColumns: un-escaped table name: {} → {}", table, plainTable);
+                    }
                     String[] resolved = resolveSynonymTarget(schema, plainTable);
                     if (resolved != null) {
-                        log.info("getColumns: local synonym {}.{} → {}.{}", schema, plainTable, resolved[0], resolved[1]);
+                        log.info("meta.getColumns: local synonym {}.{} → redirecting to {}.{}",
+                                schema, plainTable, resolved[0], resolved[1]);
                         args = args.clone();
                         args[1] = resolved[0];
                         args[2] = resolved[1];
-                    } else if (isSynonymInSystemCatalog(schema, plainTable)) {
-                        log.info("getColumns: cross-database synonym {}.{} → SELECT FIRST 0 fallback", schema, plainTable);
-                        ResultSet synthetic = buildColumnsFromQuery(schema, plainTable);
-                        if (synthetic != null) return synthetic;
+                    } else {
+                        log.debug("meta.getColumns: {}.{} not found in local syssyntable — checking systables", schema, plainTable);
+                        if (isSynonymInSystemCatalog(schema, plainTable)) {
+                            log.info("meta.getColumns: cross-database synonym {}.{} confirmed — SELECT FIRST 0 fallback", schema, plainTable);
+                            ResultSet synthetic = buildColumnsFromQuery(schema, plainTable);
+                            if (synthetic != null) return synthetic;
+                            log.warn("meta.getColumns: SELECT FIRST 0 fallback failed for {}.{} — delegating to IBM driver (may return 0 columns)", schema, plainTable);
+                        } else {
+                            log.debug("meta.getColumns: {}.{} is not a synonym (tabtype!='S') — delegating normally", schema, plainTable);
+                        }
                     }
+                } else if (table != null) {
+                    log.debug("meta.getColumns: table='{}' contains wildcard — skipping synonym resolution", table);
                 }
             }
+            log.debug("meta.{}() → delegating to IBM driver", method.getName());
             try {
                 return method.invoke(delegate, args);
             } catch (InvocationTargetException e) {
@@ -391,16 +423,21 @@ public class InformixWrapperDriver implements Driver {
                     " JOIN informix.systables t2  ON ss.btabid = t2.tabid" +
                     " WHERE t1.tabname = ? AND t1.tabtype = 'S'" +
                     (schema != null ? " AND t1.owner = ?" : "");
+            log.debug("resolveSynonymTarget: querying syssyntable JOIN for {}.{}", schema, table);
             try (PreparedStatement ps = delegate.getConnection().prepareStatement(sql)) {
                 ps.setString(1, table);
                 if (schema != null) ps.setString(2, schema);
                 try (ResultSet rs = ps.executeQuery()) {
                     if (rs.next()) {
-                        return new String[]{rs.getString("owner"), rs.getString("tabname")};
+                        String targetOwner = rs.getString("owner");
+                        String targetTable = rs.getString("tabname");
+                        log.debug("resolveSynonymTarget: {}.{} → {}.{} (local synonym resolved)", schema, table, targetOwner, targetTable);
+                        return new String[]{targetOwner, targetTable};
                     }
+                    log.debug("resolveSynonymTarget: no row found for {}.{} in syssyntable JOIN (not local, or not a synonym)", schema, table);
                 }
             } catch (Exception e) {
-                log.warn("resolveSynonymTarget({}.{}): {}", schema, table, e.getMessage());
+                log.warn("resolveSynonymTarget({}.{}): query failed — {}", schema, table, e.getMessage());
             }
             return null;
         }
@@ -409,14 +446,17 @@ public class InformixWrapperDriver implements Driver {
         private boolean isSynonymInSystemCatalog(String schema, String table) {
             String sql = "SELECT 1 FROM informix.systables WHERE tabname = ? AND tabtype = 'S'" +
                          (schema != null ? " AND owner = ?" : "");
+            log.debug("isSynonymInSystemCatalog: querying systables for {}.{} tabtype='S'", schema, table);
             try (PreparedStatement ps = delegate.getConnection().prepareStatement(sql)) {
                 ps.setString(1, table);
                 if (schema != null) ps.setString(2, schema);
                 try (ResultSet rs = ps.executeQuery()) {
-                    return rs.next();
+                    boolean found = rs.next();
+                    log.debug("isSynonymInSystemCatalog: {}.{} → {}", schema, table, found ? "IS a synonym (tabtype='S')" : "NOT a synonym");
+                    return found;
                 }
             } catch (Exception e) {
-                log.warn("isSynonymInSystemCatalog({}.{}): {}", schema, table, e.getMessage());
+                log.warn("isSynonymInSystemCatalog({}.{}): query failed — {}", schema, table, e.getMessage());
                 return false;
             }
         }
@@ -426,26 +466,38 @@ public class InformixWrapperDriver implements Driver {
         // so this succeeds where DatabaseMetaData.getColumns() returns 0 rows.
         private ResultSet buildColumnsFromQuery(String schema, String table) {
             String qualified = (schema != null && !schema.isEmpty()) ? schema + "." + table : table;
-            try (PreparedStatement ps = delegate.getConnection().prepareStatement("SELECT FIRST 0 * FROM " + qualified);
+            String querySql = "SELECT FIRST 0 * FROM " + qualified;
+            log.debug("buildColumnsFromQuery: executing '{}'", querySql);
+            try (PreparedStatement ps = delegate.getConnection().prepareStatement(querySql);
                  ResultSet rs = ps.executeQuery()) {
                 ResultSetMetaData rsmd = rs.getMetaData();
                 int count = rsmd.getColumnCount();
+                log.debug("buildColumnsFromQuery: RSMD returned {} column(s) for {}", count, qualified);
                 String[][] rows = new String[count][];
                 for (int i = 1; i <= count; i++) {
+                    String colName   = rsmd.getColumnName(i);
+                    int    sqlType   = rsmd.getColumnType(i);
+                    String typeName  = rsmd.getColumnTypeName(i);
+                    int    precision = rsmd.getPrecision(i);
+                    int    scale     = rsmd.getScale(i);
+                    String nullable  = rsmd.isNullable(i) == ResultSetMetaData.columnNoNulls ? "NO" : "YES";
+                    String autoInc   = rsmd.isAutoIncrement(i) ? "YES" : "NO";
+                    log.debug("  col[{}]: name={} sqlType={} typeName={} size={} scale={} nullable={} autoInc={}",
+                            i, colName, sqlType, typeName, precision, scale, nullable, autoInc);
                     rows[i - 1] = new String[]{
-                        rsmd.getColumnName(i),
-                        String.valueOf(rsmd.getColumnType(i)),
-                        rsmd.getColumnTypeName(i),
-                        String.valueOf(rsmd.getPrecision(i)),
-                        String.valueOf(rsmd.getScale(i)),
-                        String.valueOf(i),
-                        rsmd.isNullable(i) == ResultSetMetaData.columnNoNulls ? "NO" : "YES",
-                        rsmd.isAutoIncrement(i) ? "YES" : "NO"
+                        colName, String.valueOf(sqlType), typeName,
+                        String.valueOf(precision), String.valueOf(scale),
+                        String.valueOf(i), nullable, autoInc
                     };
+                }
+                if (count == 0) {
+                    log.warn("buildColumnsFromQuery: SELECT FIRST 0 returned 0 columns for {} — synonym may not be accessible", qualified);
+                } else {
+                    log.info("buildColumnsFromQuery: built synthetic ResultSet with {} column(s) for {}", count, qualified);
                 }
                 return syntheticColumnsResultSet(rows);
             } catch (Exception e) {
-                log.warn("buildColumnsFromQuery({}.{}): {}", schema, table, e.getMessage());
+                log.warn("buildColumnsFromQuery({}.{}): query failed — {}", schema, table, e.getMessage());
                 return null;
             }
         }
@@ -491,7 +543,11 @@ public class InformixWrapperDriver implements Driver {
         }
 
         private static String remapSynonym(String value) {
-            return "SYNONYM".equals(value) ? "TABLE" : value;
+            if ("SYNONYM".equals(value)) {
+                log.debug("GetTablesResultSet: TABLE_TYPE SYNONYM → TABLE");
+                return "TABLE";
+            }
+            return value;
         }
     }
 }
