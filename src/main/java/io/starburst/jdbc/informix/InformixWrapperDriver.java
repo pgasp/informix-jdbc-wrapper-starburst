@@ -57,7 +57,7 @@ public class InformixWrapperDriver implements Driver {
                     .getDeclaredConstructor()
                     .newInstance();
             DriverManager.registerDriver(new InformixWrapperDriver());
-            log.info("v1.7.2 IBM IfxDriver loaded OK");
+            log.info("v1.7.3 IBM IfxDriver loaded OK");
         } catch (ClassNotFoundException e) {
             log.error("FATAL: IBM IfxDriver not found in classpath: {}", e.getMessage());
             throw new ExceptionInInitializerError(
@@ -201,6 +201,14 @@ public class InformixWrapperDriver implements Driver {
                             throw new UnsupportedOperationException("syntheticColumnsResultSet: " + method.getName());
                     }
                 });
+    }
+
+    // Trino escapes table/schema names for JDBC LIKE pattern matching before passing them
+    // to DatabaseMetaData.getColumns(). Informix uses backslash as escape character, so
+    // underscores and percent signs become "\\_" and "\\%". Our system catalog queries use
+    // exact match (=), not LIKE, so we strip the escape sequences before querying systables.
+    static String unescapeMetadataPattern(String pattern) {
+        return pattern == null ? null : pattern.replaceAll("\\\\([_%])", "$1");
     }
 
     private static int colIdx(Object key) {
@@ -351,15 +359,19 @@ public class InformixWrapperDriver implements Driver {
                 String schema = (String) args[1];
                 String table  = (String) args[2];
                 if (table != null && !table.contains("%")) {
-                    String[] resolved = resolveSynonymTarget(schema, table);
+                    // Trino escapes the table name for JDBC LIKE pattern matching before passing
+                    // it to getColumns() (e.g. "s_mode_pe" → "s\_mode\_pe"). Our system catalog
+                    // queries use exact match (=), so we must un-escape first.
+                    String plainTable = unescapeMetadataPattern(table);
+                    String[] resolved = resolveSynonymTarget(schema, plainTable);
                     if (resolved != null) {
-                        log.info("getColumns: local synonym {}.{} → {}.{}", schema, table, resolved[0], resolved[1]);
+                        log.info("getColumns: local synonym {}.{} → {}.{}", schema, plainTable, resolved[0], resolved[1]);
                         args = args.clone();
                         args[1] = resolved[0];
                         args[2] = resolved[1];
-                    } else if (isSynonymInSystemCatalog(schema, table)) {
-                        log.info("getColumns: cross-database synonym {}.{} → SELECT FIRST 0 fallback", schema, table);
-                        ResultSet synthetic = buildColumnsFromQuery(schema, table);
+                    } else if (isSynonymInSystemCatalog(schema, plainTable)) {
+                        log.info("getColumns: cross-database synonym {}.{} → SELECT FIRST 0 fallback", schema, plainTable);
+                        ResultSet synthetic = buildColumnsFromQuery(schema, plainTable);
                         if (synthetic != null) return synthetic;
                     }
                 }

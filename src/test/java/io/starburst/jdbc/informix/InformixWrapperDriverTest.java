@@ -543,6 +543,43 @@ class InformixWrapperDriverTest {
                 });
     }
 
+    // --- unescapeMetadataPattern ---
+
+    @Test
+    void unescapeMetadataPattern_stripsEscapedUnderscore() {
+        assertEquals("s_mode_pe", InformixWrapperDriver.unescapeMetadataPattern("s\\_mode\\_pe"));
+    }
+
+    @Test
+    void unescapeMetadataPattern_stripsEscapedPercent() {
+        assertEquals("100%", InformixWrapperDriver.unescapeMetadataPattern("100\\%"));
+    }
+
+    @Test
+    void unescapeMetadataPattern_noEscapes_unchanged() {
+        assertEquals("cotisants", InformixWrapperDriver.unescapeMetadataPattern("cotisants"));
+    }
+
+    @Test
+    void unescapeMetadataPattern_null_returnsNull() {
+        assertNull(InformixWrapperDriver.unescapeMetadataPattern(null));
+    }
+
+    @Test
+    void getColumns_escapedSynonymName_unescapesBeforeSysCatalogQuery() throws Exception {
+        // Trino passes "s\_mode\_pe" (escaped for LIKE) — our wrapper must query systables
+        // with the plain name "s_mode_pe" or the exact-match query returns no rows.
+        CapturingMetaForColumns cap = new CapturingMetaForColumns("s_mode_pe", "informix", "pe_mode");
+        DatabaseMetaData wrapped = InformixWrapperDriver.wrapDatabaseMetaData(cap.proxy());
+
+        // Pass the JDBC-escaped form as Trino would
+        wrapped.getColumns(null, "informix", "s\\_mode\\_pe", null);
+
+        // Resolution must have succeeded → delegate called with resolved name
+        assertEquals("informix", cap.capturedSchema);
+        assertEquals("pe_mode",  cap.capturedTable);
+    }
+
     @Test
     void getColumns_crossDatabaseSynonym_buildsSyntheticResultSetFromRSMD() throws Exception {
         // DatabaseMetaData that has no local synonym resolution but IS a synonym → FIRST 0 path
