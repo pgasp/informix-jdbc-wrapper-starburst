@@ -12,6 +12,7 @@ import java.sql.DatabaseMetaData;
 import java.sql.Driver;
 import java.sql.DriverManager;
 import java.sql.DriverPropertyInfo;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
@@ -55,7 +56,7 @@ public class InformixWrapperDriver implements Driver {
                     .getDeclaredConstructor()
                     .newInstance();
             DriverManager.registerDriver(new InformixWrapperDriver());
-            log.info("v1.7.0 IBM IfxDriver loaded OK");
+            log.info("v1.7.1 IBM IfxDriver loaded OK");
         } catch (ClassNotFoundException e) {
             log.error("FATAL: IBM IfxDriver not found in classpath: {}", e.getMessage());
             throw new ExceptionInInitializerError(
@@ -295,12 +296,49 @@ public class InformixWrapperDriver implements Driver {
                     throw e.getCause();
                 }
             }
+            // getColumns: resolve synonyms before delegating. The IBM driver does not follow
+            // the synonym chain when returning column metadata, yielding 0 columns. We look up
+            // the underlying table in syssyntable first and redirect the call to it.
+            if ("getColumns".equals(method.getName()) && args != null && args.length == 4) {
+                String schema = (String) args[1];
+                String table  = (String) args[2];
+                if (table != null && !table.contains("%")) {
+                    String[] resolved = resolveSynonymTarget(schema, table);
+                    if (resolved != null) {
+                        log.info("getColumns: synonym {}.{} resolved to {}.{}", schema, table, resolved[0], resolved[1]);
+                        args = args.clone();
+                        args[1] = resolved[0];
+                        args[2] = resolved[1];
+                    }
+                }
+            }
             try {
                 return method.invoke(delegate, args);
             } catch (InvocationTargetException e) {
                 log.error("meta.{} FAILED", method.getName(), e.getCause());
                 throw e.getCause();
             }
+        }
+
+        private String[] resolveSynonymTarget(String schema, String table) {
+            String sql = "SELECT t2.owner, t2.tabname" +
+                    " FROM informix.systables t1" +
+                    " JOIN informix.syssyntable ss ON t1.tabid = ss.tabid" +
+                    " JOIN informix.systables t2  ON ss.btabid = t2.tabid" +
+                    " WHERE t1.tabname = ? AND t1.tabtype = 'S'" +
+                    (schema != null ? " AND t1.owner = ?" : "");
+            try (PreparedStatement ps = delegate.getConnection().prepareStatement(sql)) {
+                ps.setString(1, table);
+                if (schema != null) ps.setString(2, schema);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) {
+                        return new String[]{rs.getString("owner"), rs.getString("tabname")};
+                    }
+                }
+            } catch (Exception e) {
+                log.warn("resolveSynonymTarget({}.{}): {}", schema, table, e.getMessage());
+            }
+            return null;
         }
 
         private static Object[] expandTypesWithSynonym(Object[] args) {

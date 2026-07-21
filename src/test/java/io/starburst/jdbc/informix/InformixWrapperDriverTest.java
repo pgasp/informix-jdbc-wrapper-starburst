@@ -9,6 +9,7 @@ import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.DriverPropertyInfo;
+import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
@@ -307,6 +308,149 @@ class InformixWrapperDriverTest {
     void getTablesResultSet_viewType_unchanged() throws Exception {
         ResultSet wrapped = InformixWrapperDriver.wrapGetTablesResultSet(stubResultSetWithTableType("VIEW"));
         assertEquals("VIEW", wrapped.getString(4));
+    }
+
+    // --- getColumns: synonym resolution ---
+
+    /**
+     * Builds a mock DatabaseMetaData that:
+     *  - captures args passed to getColumns()
+     *  - returns a Connection whose prepareStatement() resolves the given synonym
+     */
+    private static class CapturingMetaForColumns {
+        String capturedSchema;
+        String capturedTable;
+        // null = no synonym in catalog (regular table)
+        final String synonName;
+        final String resolvedOwner;
+        final String resolvedTable;
+
+        CapturingMetaForColumns(String synonName, String resolvedOwner, String resolvedTable) {
+            this.synonName = synonName;
+            this.resolvedOwner = resolvedOwner;
+            this.resolvedTable = resolvedTable;
+        }
+
+        DatabaseMetaData proxy() {
+            CapturingMetaForColumns self = this;
+            return (DatabaseMetaData) Proxy.newProxyInstance(
+                    InformixWrapperDriverTest.class.getClassLoader(),
+                    new Class<?>[] {DatabaseMetaData.class},
+                    (p, method, args) -> {
+                        if ("getColumns".equals(method.getName())) {
+                            self.capturedSchema = (String) args[1];
+                            self.capturedTable  = (String) args[2];
+                            return emptyResultSet();
+                        }
+                        if ("getConnection".equals(method.getName())) {
+                            return synonymCatalogConnection(self.synonName, self.resolvedOwner, self.resolvedTable);
+                        }
+                        throw new UnsupportedOperationException(method.getName());
+                    });
+        }
+    }
+
+    /** Connection whose prepareStatement returns synonym resolution results. */
+    private static Connection synonymCatalogConnection(String synonName, String resolvedOwner, String resolvedTable) {
+        return (Connection) Proxy.newProxyInstance(
+                InformixWrapperDriverTest.class.getClassLoader(),
+                new Class<?>[] {Connection.class},
+                (p, method, args) -> {
+                    if ("prepareStatement".equals(method.getName())) {
+                        return synonymResolvingPs(synonName, resolvedOwner, resolvedTable);
+                    }
+                    throw new UnsupportedOperationException(method.getName());
+                });
+    }
+
+    /** PreparedStatement that returns one row [resolvedOwner, resolvedTable] when synonName matches. */
+    private static PreparedStatement synonymResolvingPs(String synonName, String resolvedOwner, String resolvedTable) {
+        String[] boundParams = new String[3]; // index 1 and 2
+        return (PreparedStatement) Proxy.newProxyInstance(
+                InformixWrapperDriverTest.class.getClassLoader(),
+                new Class<?>[] {PreparedStatement.class},
+                (p, method, args) -> {
+                    if ("setString".equals(method.getName())) {
+                        boundParams[(int) args[0]] = (String) args[1];
+                        return null;
+                    }
+                    if ("executeQuery".equals(method.getName())) {
+                        boolean matches = synonName != null && synonName.equals(boundParams[1]);
+                        return matches
+                                ? singleRowResultSet(resolvedOwner, resolvedTable)
+                                : emptyResultSet();
+                    }
+                    if ("close".equals(method.getName())) return null;
+                    throw new UnsupportedOperationException(method.getName());
+                });
+    }
+
+    /** ResultSet with one row returning [owner=resolvedOwner, tabname=resolvedTable]. */
+    private static ResultSet singleRowResultSet(String owner, String tabname) {
+        boolean[] consumed = {false};
+        return (ResultSet) Proxy.newProxyInstance(
+                InformixWrapperDriverTest.class.getClassLoader(),
+                new Class<?>[] {ResultSet.class},
+                (p, method, args) -> {
+                    if ("next".equals(method.getName())) {
+                        if (!consumed[0]) { consumed[0] = true; return Boolean.TRUE; }
+                        return Boolean.FALSE;
+                    }
+                    if ("getString".equals(method.getName()) && args[0] instanceof String) {
+                        if ("owner".equals(args[0]))   return owner;
+                        if ("tabname".equals(args[0])) return tabname;
+                    }
+                    if ("close".equals(method.getName())) return null;
+                    throw new UnsupportedOperationException(method.getName());
+                });
+    }
+
+    @Test
+    void getColumns_synonym_redirectsToUnderlyingTable() throws Exception {
+        CapturingMetaForColumns cap = new CapturingMetaForColumns("s_mode_pe", "informix", "pe_mode");
+        DatabaseMetaData wrapped = InformixWrapperDriver.wrapDatabaseMetaData(cap.proxy());
+
+        wrapped.getColumns(null, "informix", "s_mode_pe", null);
+
+        assertEquals("informix", cap.capturedSchema, "schema should be resolved owner");
+        assertEquals("pe_mode",  cap.capturedTable,  "table should be resolved tabname");
+    }
+
+    @Test
+    void getColumns_regularTable_passesThrough() throws Exception {
+        // synonName=null → no synonym found → args unchanged
+        CapturingMetaForColumns cap = new CapturingMetaForColumns(null, null, null);
+        DatabaseMetaData wrapped = InformixWrapperDriver.wrapDatabaseMetaData(cap.proxy());
+
+        wrapped.getColumns(null, "inf11adm", "cotisants", null);
+
+        assertEquals("inf11adm",  cap.capturedSchema);
+        assertEquals("cotisants", cap.capturedTable);
+    }
+
+    @Test
+    void getColumns_wildcardTable_skipsResolution() throws Exception {
+        // Table pattern with % must not trigger synonym resolution
+        CapturingMetaForColumns cap = new CapturingMetaForColumns("s_%", "informix", "pe_mode");
+        DatabaseMetaData wrapped = InformixWrapperDriver.wrapDatabaseMetaData(cap.proxy());
+
+        wrapped.getColumns(null, "informix", "s_%", null);
+
+        // Args must pass through unchanged — no resolution attempted
+        assertEquals("informix", cap.capturedSchema);
+        assertEquals("s_%",      cap.capturedTable);
+    }
+
+    @Test
+    void getColumns_noSchemaFilter_resolvesWithoutOwnerClause() throws Exception {
+        // schema=null → query without AND t1.owner=? clause
+        CapturingMetaForColumns cap = new CapturingMetaForColumns("s_mode_pe", "informix", "pe_mode");
+        DatabaseMetaData wrapped = InformixWrapperDriver.wrapDatabaseMetaData(cap.proxy());
+
+        wrapped.getColumns(null, null, "s_mode_pe", null);
+
+        assertEquals("informix", cap.capturedSchema);
+        assertEquals("pe_mode",  cap.capturedTable);
     }
 
     // --- StatementHandler (DBeaver path) ---
