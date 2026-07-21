@@ -59,7 +59,7 @@ public class InformixWrapperDriver implements Driver {
                     .getDeclaredConstructor()
                     .newInstance();
             DriverManager.registerDriver(new InformixWrapperDriver());
-            log.info("v1.7.6 IBM IfxDriver loaded OK");
+            log.info("v1.7.7 IBM IfxDriver loaded OK");
         } catch (ClassNotFoundException e) {
             log.error("FATAL: IBM IfxDriver not found in classpath: {}", e.getMessage());
             throw new ExceptionInInitializerError(
@@ -199,7 +199,9 @@ public class InformixWrapperDriver implements Driver {
                         }
                         case "getInt": {
                             int idx = colIdx(args[0]);
-                            return idx >= 0 ? Integer.parseInt(rows[cursor[0]][idx]) : 0;
+                            if (idx < 0) return 0;
+                            String v = rows[cursor[0]][idx];
+                            return v != null ? Integer.parseInt(v) : 0;
                         }
                         default:
                             throw new UnsupportedOperationException("syntheticColumnsResultSet: " + method.getName());
@@ -226,6 +228,13 @@ public class InformixWrapperDriver implements Driver {
                 case "ORDINAL_POSITION": return 5;
                 case "IS_NULLABLE":      return 6;
                 case "IS_AUTOINCREMENT": return 7;
+                // Required by BaseJdbcClient.getRemoteTable() to build RemoteTableName per row.
+                // TABLE_CAT may be null (wrapped in Optional.ofNullable by Trino); TABLE_NAME must not be null.
+                case "TABLE_NAME":       return 8;
+                case "TABLE_SCHEM":      return 9;
+                case "TABLE_CAT":        return 10;
+                // NULLABLE int (0=columnNoNulls, 1=columnNullable) mirrors IS_NULLABLE "NO"/"YES".
+                case "NULLABLE":         return 11;
             }
         }
         return -1;
@@ -378,10 +387,11 @@ public class InformixWrapperDriver implements Driver {
             //    JDBC metadata API does not. We detect this via systables.tabtype='S' and build
             //    a synthetic ResultSet from ResultSetMetaData.
             if ("getColumns".equals(method.getName()) && args != null && args.length == 4) {
-                String schema = (String) args[1];
-                String table  = (String) args[2];
+                String catalog = (String) args[0];
+                String schema  = (String) args[1];
+                String table   = (String) args[2];
                 log.debug("meta.getColumns(catalog={} schema={} table={} colPattern={})",
-                        args[0], schema, table, args[3]);
+                        catalog, schema, table, args[3]);
                 if (table != null && !table.contains("%")) {
                     // Trino escapes the table name for JDBC LIKE pattern matching before passing
                     // it to getColumns() (e.g. "s_mode_pe" → "s\_mode\_pe"). Our system catalog
@@ -401,7 +411,7 @@ public class InformixWrapperDriver implements Driver {
                         log.debug("meta.getColumns: {}.{} not found in local syssyntable — checking systables", schema, plainTable);
                         if (isSynonymInSystemCatalog(schema, plainTable)) {
                             log.info("meta.getColumns: cross-database synonym {}.{} confirmed — WHERE 1=0 fallback", schema, plainTable);
-                            ResultSet synthetic = buildColumnsFromQuery(schema, plainTable);
+                            ResultSet synthetic = buildColumnsFromQuery(catalog, schema, plainTable);
                             if (synthetic != null) return synthetic;
                             log.warn("meta.getColumns: WHERE 1=0 fallback failed for {}.{} — delegating to IBM driver (may return 0 columns)", schema, plainTable);
                         } else {
@@ -471,14 +481,16 @@ public class InformixWrapperDriver implements Driver {
         // so this succeeds where DatabaseMetaData.getColumns() returns 0 rows.
         // NOTE: "SELECT FIRST 0 *" is invalid Informix syntax — FIRST requires N >= 1.
         // We use WHERE 1=0 instead to get 0 rows without a FIRST clause.
-        // Results are cached in columnCache (keyed by "schema|table") so the query runs at most
-        // once per synonym per DatabaseMetaData instance (i.e. per connection lifetime).
+        // Results are cached in columnCache (keyed by "catalog|schema|table") so the query runs
+        // at most once per synonym per DatabaseMetaData instance (i.e. per connection lifetime).
         // Three SQL forms are tried in order to handle DELIMIDENT=y and reserved owner names:
         //   1. schema.table       — standard unquoted owner.tablename
         //   2. "schema"."table"   — fully quoted (DELIMIDENT=y safe)
         //   3. table              — no schema prefix (relies on connection database context)
-        private ResultSet buildColumnsFromQuery(String schema, String table) {
-            String cacheKey = (schema != null ? schema : "") + "|" + table;
+        // The catalog parameter is stored in each row as TABLE_CAT so that BaseJdbcClient can
+        // construct a RemoteTableName matching the expected syn11.informix.table value.
+        private ResultSet buildColumnsFromQuery(String catalog, String schema, String table) {
+            String cacheKey = (catalog != null ? catalog : "") + "|" + (schema != null ? schema : "") + "|" + table;
             String[][] cached = columnCache.get(cacheKey);
             if (cached != null) {
                 log.debug("buildColumnsFromQuery: cache hit for {} ({} column(s))", cacheKey, cached.length);
@@ -526,10 +538,13 @@ public class InformixWrapperDriver implements Driver {
                             " displaySize={} nullable={} autoInc={} src={}.{}.{}",
                             col, colName, colLabel, sqlType, typeName, precision, scale,
                             displaySz, nullable, autoInc, srcCatalog, srcSchema, srcTable);
+                        // NULLABLE int: 1=columnNullable, 0=columnNoNulls (mirrors IS_NULLABLE "YES"/"NO")
+                        String nullableInt = "YES".equals(nullable) ? "1" : "0";
                         rows[col - 1] = new String[]{
-                            colName, String.valueOf(sqlType), typeName,
-                            String.valueOf(precision), String.valueOf(scale),
-                            String.valueOf(col), nullable, autoInc
+                            colName, String.valueOf(sqlType), typeName,         // 0-2
+                            String.valueOf(precision), String.valueOf(scale),   // 3-4
+                            String.valueOf(col), nullable, autoInc,             // 5-7
+                            table, schema, catalog, nullableInt                 // 8-11: TABLE_NAME, TABLE_SCHEM, TABLE_CAT, NULLABLE
                         };
                     }
                     if (count == 0) {
