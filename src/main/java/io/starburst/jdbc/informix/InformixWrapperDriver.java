@@ -57,7 +57,7 @@ public class InformixWrapperDriver implements Driver {
                     .getDeclaredConstructor()
                     .newInstance();
             DriverManager.registerDriver(new InformixWrapperDriver());
-            log.info("v1.7.4 IBM IfxDriver loaded OK");
+            log.info("v1.7.5 IBM IfxDriver loaded OK");
         } catch (ClassNotFoundException e) {
             log.error("FATAL: IBM IfxDriver not found in classpath: {}", e.getMessage());
             throw new ExceptionInInitializerError(
@@ -368,7 +368,7 @@ public class InformixWrapperDriver implements Driver {
             // the synonym chain when returning column metadata, yielding 0 columns.
             // Two strategies, in order:
             // 1. syssyntable JOIN — works for local (same-database) synonyms
-            // 2. SELECT FIRST 0 * fallback — for cross-database synonyms where btabid maps to
+            // 2. SELECT * WHERE 1=0 fallback — for cross-database synonyms where btabid maps to
             //    a table in another database, Informix's SQL engine follows the chain but the
             //    JDBC metadata API does not. We detect this via systables.tabtype='S' and build
             //    a synthetic ResultSet from ResultSetMetaData.
@@ -395,10 +395,10 @@ public class InformixWrapperDriver implements Driver {
                     } else {
                         log.debug("meta.getColumns: {}.{} not found in local syssyntable — checking systables", schema, plainTable);
                         if (isSynonymInSystemCatalog(schema, plainTable)) {
-                            log.info("meta.getColumns: cross-database synonym {}.{} confirmed — SELECT FIRST 0 fallback", schema, plainTable);
+                            log.info("meta.getColumns: cross-database synonym {}.{} confirmed — WHERE 1=0 fallback", schema, plainTable);
                             ResultSet synthetic = buildColumnsFromQuery(schema, plainTable);
                             if (synthetic != null) return synthetic;
-                            log.warn("meta.getColumns: SELECT FIRST 0 fallback failed for {}.{} — delegating to IBM driver (may return 0 columns)", schema, plainTable);
+                            log.warn("meta.getColumns: WHERE 1=0 fallback failed for {}.{} — delegating to IBM driver (may return 0 columns)", schema, plainTable);
                         } else {
                             log.debug("meta.getColumns: {}.{} is not a synonym (tabtype!='S') — delegating normally", schema, plainTable);
                         }
@@ -461,45 +461,65 @@ public class InformixWrapperDriver implements Driver {
             }
         }
 
-        // Executes "SELECT FIRST 0 *" and builds a synthetic getColumns() ResultSet from RSMD.
+        // Executes "SELECT * FROM ... WHERE 1=0" and builds a synthetic getColumns() ResultSet from RSMD.
         // Informix follows the synonym chain at the SQL level even for cross-database synonyms,
         // so this succeeds where DatabaseMetaData.getColumns() returns 0 rows.
+        // NOTE: "SELECT FIRST 0 *" is invalid Informix syntax — FIRST requires N >= 1.
+        // We use WHERE 1=0 instead to get 0 rows without a FIRST clause.
+        // Attempts three SQL forms in order to handle DELIMIDENT=y and reserved owner names
+        // (e.g. "informix" is the Informix system owner and may be reserved in some contexts):
+        //   1. schema.table       — standard unquoted owner.tablename
+        //   2. "schema"."table"   — fully quoted (DELIMIDENT=y safe)
+        //   3. table              — no schema prefix (relies on connection database context)
         private ResultSet buildColumnsFromQuery(String schema, String table) {
-            String qualified = (schema != null && !schema.isEmpty()) ? schema + "." + table : table;
-            String querySql = "SELECT FIRST 0 * FROM " + qualified;
-            log.debug("buildColumnsFromQuery: executing '{}'", querySql);
-            try (PreparedStatement ps = delegate.getConnection().prepareStatement(querySql);
-                 ResultSet rs = ps.executeQuery()) {
-                ResultSetMetaData rsmd = rs.getMetaData();
-                int count = rsmd.getColumnCount();
-                log.debug("buildColumnsFromQuery: RSMD returned {} column(s) for {}", count, qualified);
-                String[][] rows = new String[count][];
-                for (int i = 1; i <= count; i++) {
-                    String colName   = rsmd.getColumnName(i);
-                    int    sqlType   = rsmd.getColumnType(i);
-                    String typeName  = rsmd.getColumnTypeName(i);
-                    int    precision = rsmd.getPrecision(i);
-                    int    scale     = rsmd.getScale(i);
-                    String nullable  = rsmd.isNullable(i) == ResultSetMetaData.columnNoNulls ? "NO" : "YES";
-                    String autoInc   = rsmd.isAutoIncrement(i) ? "YES" : "NO";
-                    log.debug("  col[{}]: name={} sqlType={} typeName={} size={} scale={} nullable={} autoInc={}",
-                            i, colName, sqlType, typeName, precision, scale, nullable, autoInc);
-                    rows[i - 1] = new String[]{
-                        colName, String.valueOf(sqlType), typeName,
-                        String.valueOf(precision), String.valueOf(scale),
-                        String.valueOf(i), nullable, autoInc
-                    };
-                }
-                if (count == 0) {
-                    log.warn("buildColumnsFromQuery: SELECT FIRST 0 returned 0 columns for {} — synonym may not be accessible", qualified);
-                } else {
-                    log.info("buildColumnsFromQuery: built synthetic ResultSet with {} column(s) for {}", count, qualified);
-                }
-                return syntheticColumnsResultSet(rows);
-            } catch (Exception e) {
-                log.warn("buildColumnsFromQuery({}.{}): query failed — {}", schema, table, e.getMessage());
-                return null;
+            boolean hasSchema = schema != null && !schema.isEmpty();
+            String[] candidates;
+            if (hasSchema) {
+                candidates = new String[]{
+                    schema + "." + table,
+                    "\"" + schema + "\".\"" + table + "\"",
+                    table
+                };
+            } else {
+                candidates = new String[]{ table };
             }
+            for (String qualified : candidates) {
+                String querySql = "SELECT * FROM " + qualified + " WHERE 1=0";
+                log.debug("buildColumnsFromQuery: trying '{}'", querySql);
+                try (PreparedStatement ps = delegate.getConnection().prepareStatement(querySql);
+                     ResultSet rs = ps.executeQuery()) {
+                    ResultSetMetaData rsmd = rs.getMetaData();
+                    int count = rsmd.getColumnCount();
+                    log.debug("buildColumnsFromQuery: RSMD returned {} column(s) for {}", count, qualified);
+                    String[][] rows = new String[count][];
+                    for (int i = 1; i <= count; i++) {
+                        String colName   = rsmd.getColumnName(i);
+                        int    sqlType   = rsmd.getColumnType(i);
+                        String typeName  = rsmd.getColumnTypeName(i);
+                        int    precision = rsmd.getPrecision(i);
+                        int    scale     = rsmd.getScale(i);
+                        String nullable  = rsmd.isNullable(i) == ResultSetMetaData.columnNoNulls ? "NO" : "YES";
+                        String autoInc   = rsmd.isAutoIncrement(i) ? "YES" : "NO";
+                        log.debug("  col[{}]: name={} sqlType={} typeName={} size={} scale={} nullable={} autoInc={}",
+                                i, colName, sqlType, typeName, precision, scale, nullable, autoInc);
+                        rows[i - 1] = new String[]{
+                            colName, String.valueOf(sqlType), typeName,
+                            String.valueOf(precision), String.valueOf(scale),
+                            String.valueOf(i), nullable, autoInc
+                        };
+                    }
+                    if (count == 0) {
+                        log.warn("buildColumnsFromQuery: query succeeded but returned 0 columns for {} — synonym may not be accessible", qualified);
+                    } else {
+                        log.info("buildColumnsFromQuery: built synthetic ResultSet with {} column(s) for {} (form: '{}')", count, qualified, querySql);
+                    }
+                    return syntheticColumnsResultSet(rows);
+                } catch (Exception e) {
+                    log.debug("buildColumnsFromQuery: '{}' failed — {} (trying next form)", querySql, e.getMessage());
+                }
+            }
+            log.warn("buildColumnsFromQuery({}.{}): all SQL forms failed — synonym columns unavailable", schema, table);
+            return null;
         }
 
         private static Object[] expandTypesWithSynonym(Object[] args) {

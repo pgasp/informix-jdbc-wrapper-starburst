@@ -442,13 +442,13 @@ class InformixWrapperDriverTest {
         assertEquals("s_%",      cap.capturedTable);
     }
 
-    // --- getColumns: cross-database synonym fallback (SELECT FIRST 0 *) ---
+    // --- getColumns: cross-database synonym fallback (SELECT * WHERE 1=0) ---
 
     /**
      * Connection that routes prepareStatement() calls by SQL content:
      * - syssyntable JOIN → empty (cross-db: btabid not in local systables)
      * - systables tabtype check → one row (it IS a synonym)
-     * - SELECT FIRST 0 * → ResultSet with 2-column ResultSetMetaData
+     * - SELECT * WHERE 1=0 → ResultSet with 2-column ResultSetMetaData
      */
     private static Connection crossDbSynonymConnection() {
         return (Connection) Proxy.newProxyInstance(
@@ -457,9 +457,9 @@ class InformixWrapperDriverTest {
                 (p, method, args) -> {
                     if ("prepareStatement".equals(method.getName())) {
                         String sql = (String) args[0];
-                        if (sql.contains("syssyntable")) return emptyPs();       // JOIN fails for cross-db
+                        if (sql.contains("syssyntable")) return emptyPs();        // JOIN fails for cross-db
                         if (sql.contains("tabtype"))     return synonymCheckPs(); // IS a synonym
-                        if (sql.contains("FIRST 0"))     return first0Ps();       // column discovery
+                        if (sql.contains("WHERE 1=0"))   return zeroRowPs();      // column discovery
                     }
                     throw new UnsupportedOperationException(method.getName());
                 });
@@ -502,8 +502,8 @@ class InformixWrapperDriverTest {
                 });
     }
 
-    /** PreparedStatement for "SELECT FIRST 0 *" — returns a RS with 2-column RSMD. */
-    private static PreparedStatement first0Ps() {
+    /** PreparedStatement for "SELECT * WHERE 1=0" — returns a RS with 2-column RSMD. */
+    private static PreparedStatement zeroRowPs() {
         return (PreparedStatement) Proxy.newProxyInstance(
                 InformixWrapperDriverTest.class.getClassLoader(),
                 new Class<?>[] {PreparedStatement.class},
@@ -582,7 +582,7 @@ class InformixWrapperDriverTest {
 
     @Test
     void getColumns_crossDatabaseSynonym_buildsSyntheticResultSetFromRSMD() throws Exception {
-        // DatabaseMetaData that has no local synonym resolution but IS a synonym → FIRST 0 path
+        // DatabaseMetaData that has no local synonym resolution but IS a synonym → WHERE 1=0 path
         DatabaseMetaData meta = (DatabaseMetaData) Proxy.newProxyInstance(
                 InformixWrapperDriverTest.class.getClassLoader(),
                 new Class<?>[] {DatabaseMetaData.class},
