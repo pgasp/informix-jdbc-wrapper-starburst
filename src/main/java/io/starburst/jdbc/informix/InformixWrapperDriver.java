@@ -59,7 +59,7 @@ public class InformixWrapperDriver implements Driver {
                     .getDeclaredConstructor()
                     .newInstance();
             DriverManager.registerDriver(new InformixWrapperDriver());
-            log.info("v1.7.7 IBM IfxDriver loaded OK");
+            log.info("v1.7.8 IBM IfxDriver loaded OK");
         } catch (ClassNotFoundException e) {
             log.error("FATAL: IBM IfxDriver not found in classpath: {}", e.getMessage());
             throw new ExceptionInInitializerError(
@@ -515,36 +515,24 @@ public class InformixWrapperDriver implements Driver {
                      ResultSet rs = ps.executeQuery()) {
                     ResultSetMetaData rsmd = rs.getMetaData();
                     int count = rsmd.getColumnCount();
-                    // Log full RSMD dump — catalog/schema/table fields confirm the synonym chain
-                    // was followed by the SQL engine, and help diagnose type mapping issues.
-                    log.debug("buildColumnsFromQuery: RSMD for '{}' — {} column(s)", qualified, count);
                     String[][] rows = new String[count][];
                     for (int i = 1; i <= count; i++) {
-                        final int col = i;
-                        String colName    = rsmd.getColumnName(col);
-                        String colLabel   = safeGet(() -> rsmd.getColumnLabel(col));
-                        int    sqlType    = rsmd.getColumnType(col);
-                        String typeName   = rsmd.getColumnTypeName(col);
-                        int    precision  = rsmd.getPrecision(col);
-                        int    scale      = rsmd.getScale(col);
-                        String displaySz  = safeGet(() -> String.valueOf(rsmd.getColumnDisplaySize(col)));
-                        String nullable   = rsmd.isNullable(col) == ResultSetMetaData.columnNoNulls ? "NO" : "YES";
-                        String autoInc    = rsmd.isAutoIncrement(col) ? "YES" : "NO";
-                        String srcCatalog = safeGet(() -> rsmd.getCatalogName(col));
-                        String srcSchema  = safeGet(() -> rsmd.getSchemaName(col));
-                        String srcTable   = safeGet(() -> rsmd.getTableName(col));
-                        log.debug(
-                            "  col[{}] name={} label={} sqlType={} typeName={} precision={} scale={}" +
-                            " displaySize={} nullable={} autoInc={} src={}.{}.{}",
-                            col, colName, colLabel, sqlType, typeName, precision, scale,
-                            displaySz, nullable, autoInc, srcCatalog, srcSchema, srcTable);
+                        String colName  = rsmd.getColumnName(i);
+                        int    sqlType  = rsmd.getColumnType(i);
+                        String typeName = rsmd.getColumnTypeName(i);
+                        int    precision = rsmd.getPrecision(i);
+                        int    scale    = rsmd.getScale(i);
+                        String nullable = rsmd.isNullable(i) == ResultSetMetaData.columnNoNulls ? "NO" : "YES";
+                        String autoInc  = rsmd.isAutoIncrement(i) ? "YES" : "NO";
+                        log.debug("  col[{}] name={} sqlType={} typeName={} precision={} scale={} nullable={} autoInc={}",
+                                i, colName, sqlType, typeName, precision, scale, nullable, autoInc);
                         // NULLABLE int: 1=columnNullable, 0=columnNoNulls (mirrors IS_NULLABLE "YES"/"NO")
                         String nullableInt = "YES".equals(nullable) ? "1" : "0";
-                        rows[col - 1] = new String[]{
-                            colName, String.valueOf(sqlType), typeName,         // 0-2
-                            String.valueOf(precision), String.valueOf(scale),   // 3-4
-                            String.valueOf(col), nullable, autoInc,             // 5-7
-                            table, schema, catalog, nullableInt                 // 8-11: TABLE_NAME, TABLE_SCHEM, TABLE_CAT, NULLABLE
+                        rows[i - 1] = new String[]{
+                            colName, String.valueOf(sqlType), typeName,
+                            String.valueOf(precision), String.valueOf(scale),
+                            String.valueOf(i), nullable, autoInc,
+                            table, schema, catalog, nullableInt
                         };
                     }
                     if (count == 0) {
@@ -561,15 +549,6 @@ public class InformixWrapperDriver implements Driver {
             log.warn("buildColumnsFromQuery({}.{}): all SQL forms failed — synonym columns unavailable", schema, table);
             return null;
         }
-
-        // Calls a supplier that may throw a checked exception; returns the value or "?" on error.
-        // Used for optional RSMD fields (catalog/schema/table) that some drivers don't implement.
-        private static String safeGet(SqlSupplier<String> s) {
-            try { return s.get(); } catch (Exception e) { return "?"; }
-        }
-
-        @FunctionalInterface
-        interface SqlSupplier<T> { T get() throws Exception; }
 
         private static Object[] expandTypesWithSynonym(Object[] args) {
             String[] types = (String[]) args[3];
