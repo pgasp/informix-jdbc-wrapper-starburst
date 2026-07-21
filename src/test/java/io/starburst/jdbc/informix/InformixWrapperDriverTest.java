@@ -9,9 +9,13 @@ import java.lang.reflect.Proxy;
 import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.DriverPropertyInfo;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
 import java.sql.Statement;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
 import java.util.Properties;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -180,8 +184,8 @@ class InformixWrapperDriverTest {
     }
 
     @Test
-    void getMinorVersion_returns6() {
-        assertEquals(6, driver.getMinorVersion());
+    void getMinorVersion_returns7() {
+        assertEquals(7, driver.getMinorVersion());
     }
 
     @Test
@@ -192,6 +196,117 @@ class InformixWrapperDriverTest {
     @Test
     void getParentLogger_throwsSQLFeatureNotSupportedException() {
         assertThrows(SQLFeatureNotSupportedException.class, () -> driver.getParentLogger());
+    }
+
+    // --- getTables: SYNONYM expansion ---
+
+    /** Captures the types[] array passed to DatabaseMetaData.getTables(). */
+    private static class CapturingMeta {
+        String[] capturedTypes;
+
+        DatabaseMetaData proxy() {
+            return (DatabaseMetaData) Proxy.newProxyInstance(
+                    InformixWrapperDriverTest.class.getClassLoader(),
+                    new Class<?>[] {DatabaseMetaData.class},
+                    (p, method, args) -> {
+                        if ("getTables".equals(method.getName())) {
+                            capturedTypes = (String[]) args[3];
+                            // Return an empty ResultSet stub
+                            return emptyResultSet();
+                        }
+                        if ("getIdentifierQuoteString".equals(method.getName())) return "\"";
+                        throw new UnsupportedOperationException(method.getName());
+                    });
+        }
+    }
+
+    private static ResultSet emptyResultSet() {
+        return (ResultSet) Proxy.newProxyInstance(
+                InformixWrapperDriverTest.class.getClassLoader(),
+                new Class<?>[] {ResultSet.class},
+                (p, method, args) -> {
+                    if ("next".equals(method.getName())) return Boolean.FALSE;
+                    if ("close".equals(method.getName())) return null;
+                    throw new UnsupportedOperationException(method.getName());
+                });
+    }
+
+    @Test
+    void getTables_nullTypes_addsSynonym() throws Exception {
+        CapturingMeta cap = new CapturingMeta();
+        DatabaseMetaData wrapped = InformixWrapperDriver.wrapDatabaseMetaData(cap.proxy());
+
+        wrapped.getTables(null, null, null, null);
+
+        List<String> types = Arrays.asList(cap.capturedTypes);
+        assertTrue(types.contains("SYNONYM"), "SYNONYM should be added when types is null");
+        assertTrue(types.contains("TABLE"));
+        assertTrue(types.contains("VIEW"));
+    }
+
+    @Test
+    void getTables_explicitTableView_addsSynonym() throws Exception {
+        CapturingMeta cap = new CapturingMeta();
+        DatabaseMetaData wrapped = InformixWrapperDriver.wrapDatabaseMetaData(cap.proxy());
+
+        wrapped.getTables(null, null, null, new String[]{"TABLE", "VIEW"});
+
+        List<String> types = Arrays.asList(cap.capturedTypes);
+        assertTrue(types.contains("SYNONYM"));
+        assertTrue(types.contains("TABLE"));
+        assertTrue(types.contains("VIEW"));
+    }
+
+    @Test
+    void getTables_synonymAlreadyPresent_noDuplicate() throws Exception {
+        CapturingMeta cap = new CapturingMeta();
+        DatabaseMetaData wrapped = InformixWrapperDriver.wrapDatabaseMetaData(cap.proxy());
+
+        wrapped.getTables(null, null, null, new String[]{"TABLE", "SYNONYM"});
+
+        long count = Arrays.stream(cap.capturedTypes).filter("SYNONYM"::equals).count();
+        assertEquals(1, count, "SYNONYM should not be duplicated");
+    }
+
+    // --- GetTablesResultSet: TABLE_TYPE remapping ---
+
+    /** Builds a ResultSet that returns the given TABLE_TYPE value. */
+    private static ResultSet stubResultSetWithTableType(String tableType) {
+        return (ResultSet) Proxy.newProxyInstance(
+                InformixWrapperDriverTest.class.getClassLoader(),
+                new Class<?>[] {ResultSet.class},
+                (p, method, args) -> {
+                    if ("getString".equals(method.getName()) && args != null && args.length == 1) {
+                        if (args[0] instanceof Integer && (Integer) args[0] == 4) return tableType;
+                        if (args[0] instanceof String && "TABLE_TYPE".equalsIgnoreCase((String) args[0])) return tableType;
+                    }
+                    throw new UnsupportedOperationException(method.getName());
+                });
+    }
+
+    @Test
+    void getTablesResultSet_synonymByIndex_remappedToTable() throws Exception {
+        ResultSet wrapped = InformixWrapperDriver.wrapGetTablesResultSet(stubResultSetWithTableType("SYNONYM"));
+        assertEquals("TABLE", wrapped.getString(4));
+    }
+
+    @Test
+    void getTablesResultSet_synonymByName_remappedToTable() throws Exception {
+        ResultSet wrapped = InformixWrapperDriver.wrapGetTablesResultSet(stubResultSetWithTableType("SYNONYM"));
+        assertEquals("TABLE", wrapped.getString("TABLE_TYPE"));
+    }
+
+    @Test
+    void getTablesResultSet_tableType_unchanged() throws Exception {
+        ResultSet wrapped = InformixWrapperDriver.wrapGetTablesResultSet(stubResultSetWithTableType("TABLE"));
+        assertEquals("TABLE", wrapped.getString(4));
+        assertEquals("TABLE", wrapped.getString("TABLE_TYPE"));
+    }
+
+    @Test
+    void getTablesResultSet_viewType_unchanged() throws Exception {
+        ResultSet wrapped = InformixWrapperDriver.wrapGetTablesResultSet(stubResultSetWithTableType("VIEW"));
+        assertEquals("VIEW", wrapped.getString(4));
     }
 
     // --- StatementHandler (DBeaver path) ---

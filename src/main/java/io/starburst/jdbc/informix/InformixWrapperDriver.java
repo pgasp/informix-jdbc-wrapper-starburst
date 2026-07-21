@@ -12,10 +12,14 @@ import java.sql.DatabaseMetaData;
 import java.sql.Driver;
 import java.sql.DriverManager;
 import java.sql.DriverPropertyInfo;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.SQLFeatureNotSupportedException;
 import java.sql.Statement;
+import java.util.Arrays;
+import java.util.LinkedHashSet;
 import java.util.Properties;
+import java.util.Set;
 
 /**
  * Accepts jdbc:informix: URLs and rewrites them to jdbc:informix-sqli: before
@@ -51,7 +55,7 @@ public class InformixWrapperDriver implements Driver {
                     .getDeclaredConstructor()
                     .newInstance();
             DriverManager.registerDriver(new InformixWrapperDriver());
-            log.info("v1.6.1 IBM IfxDriver loaded OK");
+            log.info("v1.7.0 IBM IfxDriver loaded OK");
         } catch (ClassNotFoundException e) {
             log.error("FATAL: IBM IfxDriver not found in classpath: {}", e.getMessage());
             throw new ExceptionInInitializerError(
@@ -144,7 +148,7 @@ public class InformixWrapperDriver implements Driver {
 
     @Override
     public int getMinorVersion() {
-        return 6;
+        return 7;
     }
 
     @Override
@@ -169,6 +173,13 @@ public class InformixWrapperDriver implements Driver {
                 InformixWrapperDriver.class.getClassLoader(),
                 new Class<?>[] {DatabaseMetaData.class},
                 new DatabaseMetaDataHandler(meta));
+    }
+
+    static ResultSet wrapGetTablesResultSet(ResultSet rs) {
+        return (ResultSet) Proxy.newProxyInstance(
+                InformixWrapperDriver.class.getClassLoader(),
+                new Class<?>[] {ResultSet.class},
+                new GetTablesResultSetHandler(rs));
     }
 
     static Statement wrapStatement(Statement stmt, String catalogPrefix) {
@@ -271,12 +282,69 @@ public class InformixWrapperDriver implements Driver {
 
         @Override
         public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+            // getTables: expand types to include SYNONYM so Informix synonyms appear in the
+            // catalog. The returned ResultSet is wrapped to remap TABLE_TYPE "SYNONYM" → "TABLE"
+            // because Starburst filters the result on TABLE_TYPE and only retains TABLE/VIEW.
+            if ("getTables".equals(method.getName()) && args != null && args.length == 4) {
+                args = expandTypesWithSynonym(args);
+                try {
+                    Object rs = method.invoke(delegate, args);
+                    return rs == null ? null : wrapGetTablesResultSet((ResultSet) rs);
+                } catch (InvocationTargetException e) {
+                    log.error("meta.getTables FAILED", e.getCause());
+                    throw e.getCause();
+                }
+            }
             try {
                 return method.invoke(delegate, args);
             } catch (InvocationTargetException e) {
                 log.error("meta.{} FAILED", method.getName(), e.getCause());
                 throw e.getCause();
             }
+        }
+
+        private static Object[] expandTypesWithSynonym(Object[] args) {
+            String[] types = (String[]) args[3];
+            Set<String> typeSet = types != null
+                    ? new LinkedHashSet<>(Arrays.asList(types))
+                    : new LinkedHashSet<>(Arrays.asList("TABLE", "VIEW"));
+            if (typeSet.add("SYNONYM")) {
+                args = args.clone();
+                args[3] = typeSet.toArray(new String[0]);
+            }
+            return args;
+        }
+    }
+
+    static final class GetTablesResultSetHandler implements InvocationHandler {
+        private final ResultSet delegate;
+
+        GetTablesResultSetHandler(ResultSet delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public Object invoke(Object proxy, Method method, Object[] args) throws Throwable {
+            try {
+                Object result = method.invoke(delegate, args);
+                if ("getString".equals(method.getName()) && args != null && args.length == 1) {
+                    // TABLE_TYPE is column 4 per DatabaseMetaData.getTables() JDBC spec
+                    if (args[0] instanceof Integer && (Integer) args[0] == 4) {
+                        return remapSynonym((String) result);
+                    }
+                    if (args[0] instanceof String && "TABLE_TYPE".equalsIgnoreCase((String) args[0])) {
+                        return remapSynonym((String) result);
+                    }
+                }
+                return result;
+            } catch (InvocationTargetException e) {
+                log.error("GetTablesResultSet.{} FAILED", method.getName(), e.getCause());
+                throw e.getCause();
+            }
+        }
+
+        private static String remapSynonym(String value) {
+            return "SYNONYM".equals(value) ? "TABLE" : value;
         }
     }
 }
